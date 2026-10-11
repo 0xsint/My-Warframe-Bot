@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-
+import asyncio
 import aiohttp
 import nextcord
 from dotenv import load_dotenv
@@ -37,23 +37,23 @@ intents.presences = False
 # to be enabled in the Discord Developer Portal.
 
 
-class WarframeBot(commands.Bot):
-    """Bot subclass that owns the aiohttp session + wiki client lifecycle."""
+from market.client import WarframeMarketClient   # new import
 
+class WarframeBot(commands.Bot):
     def __init__(self) -> None:
         super().__init__(intents=intents)
-        self.wiki: WarframeWikiClient | None = None
-        self._http_session: aiohttp.ClientSession | None = None
+        self.wiki = None
+        self.market: WarframeMarketClient | None = None   # new
+        self._http_session = None
         self.load_extension("cogs.wiki_commands")
+        self.load_extension("cogs.market_commands")       # new
 
-    async def start(self, token: str, *, reconnect: bool = True) -> None:
-        # Created here (rather than in __init__) so the session is bound to
-        # the event loop that's actually running.
+    async def start(self, token, *, reconnect=True):
         self._http_session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
         self.wiki = WarframeWikiClient(self._http_session)
-        log.info("WARFRAME Wiki client ready.")
+        self.market = WarframeMarketClient(self._http_session)          # new
+        asyncio.create_task(self.market.load_items())  # new: warm autocomplete (add `import asyncio`)
         await super().start(token, reconnect=reconnect)
-
     async def close(self) -> None:
         if self._http_session is not None and not self._http_session.closed:
             await self._http_session.close()
