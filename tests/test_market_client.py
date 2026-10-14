@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from market.client import ItemNotFound, MarketClient, MarketError
+from market.client import ItemNotFound, WarframeMarketClient, MarketError
 
 ITEMS = {"data": [
     {"slug": "mirage_prime_set", "i18n": {"en": {"name": "Mirage Prime Set", "icon": "a.png"}}},
@@ -53,7 +53,7 @@ def run(coro):
 
 
 def test_search_ranking_substring_and_typo():
-    c = MarketClient(FakeSession())
+    c = WarframeMarketClient(FakeSession())
     assert run(c.search_items("mirage prime set", 3))[0].slug == "mirage_prime_set"
     assert {i.slug for i in run(c.search_items("mirage", 5))} == {"mirage_prime_set", "mirage_prime_systems"}
     assert run(c.search_items("serrration", 3))[0].slug == "serration"        # typo -> fuzzy
@@ -62,7 +62,7 @@ def test_search_ranking_substring_and_typo():
 
 def test_item_list_loaded_once_and_cached():
     s = FakeSession()
-    c = MarketClient(s)
+    c = WarframeMarketClient(s)
     run(c.search_items("serration"))
     run(c.search_items("mirage"))
     assert sum(1 for u, _ in s.calls if u.endswith("/items")) == 1
@@ -70,7 +70,7 @@ def test_item_list_loaded_once_and_cached():
 
 def test_orders_headers_cache_and_parse():
     s = FakeSession()
-    c = MarketClient(s, platform="ps4", crossplay=False)
+    c = WarframeMarketClient(s, platform="ps4", crossplay=False)
     orders = run(c.get_orders("mirage_prime_set"))
     run(c.get_orders("mirage_prime_set"))                                     # cached
     assert len(orders) == 2 and len([u for u, _ in s.calls if "/orders/item/" in u]) == 1
@@ -81,7 +81,7 @@ def test_orders_headers_cache_and_parse():
 
 
 def test_not_found_and_resolve():
-    c = MarketClient(FakeSession())
+    c = WarframeMarketClient(FakeSession())
     try:
         run(c.get_orders("nope"))
         assert False, "should raise"
@@ -95,7 +95,7 @@ def test_not_found_and_resolve():
 
 
 def test_history_weighted_average():
-    h = run(MarketClient(FakeSession()).get_history("serration"))
+    h = run(WarframeMarketClient(FakeSession()).get_history("serration"))
     assert h["volume_48h"] == 40 and h["avg_price_48h"] == 37.5               # (10*30+30*40)/40
 
 
@@ -103,11 +103,11 @@ def test_history_failure_returns_none():
     class Boom(FakeSession):
         def get(self, url, params=None, headers=None):
             return FakeResp(500, {})
-    assert run(MarketClient(Boom()).get_history("serration")) is None
+    assert run(WarframeMarketClient(Boom()).get_history("serration")) is None
 
 
 def test_rate_limiter_spaces_calls():
-    c = MarketClient(FakeSession(), min_interval=0.1, cache_ttl=0)
+    c = WarframeMarketClient(FakeSession(), min_interval=0.1, cache_ttl=0)
     async def burst():
         await asyncio.gather(*[c.get_orders("serration") for _ in range(4)])
 
