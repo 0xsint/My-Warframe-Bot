@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from market.analysis import assess_price, build_report, top_orders, whisper
-from market.client import ItemNotFound, MarketClient, MarketError
+from market.client import ItemNotFound, WarframeMarketClient, MarketError
 
 Platform = Literal["pc", "ps4", "xbox", "switch"]
 Side = Literal["sell", "buy"]
@@ -32,7 +32,7 @@ Side = Literal["sell", "buy"]
 async def lifespan(app: FastAPI):
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        app.state.market = MarketClient(session)
+        app.state.market = WarframeMarketClient(session)
         yield
 
 
@@ -53,7 +53,7 @@ def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key")
 
 
-def client() -> MarketClient:
+def client() -> WarframeMarketClient:
     return app.state.market
 
 
