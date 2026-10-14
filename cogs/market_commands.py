@@ -1,287 +1,135 @@
-"""/wfm slash commands backed by warframe.market.
+"""/wm  -- warframe.market tools aimed at people who SELL.
 
-    /wfm price      item [rank] [platform]
-    /wfm compare    item1 item2 [item3] [item4] [rank] [platform]
-    /wfm available  item [max_price] [quantity] [rank] [platform]
-    /wfm set        item [platform]
-    /wfm trend      item [rank] [platform]
+    /wm price   item:<..> [rank] [platform] [my_price]   pricing dashboard
+    /wm buyers  item:<..> [rank] [platform]              online buyers + copy-paste whispers
+    /wm sellers item:<..> [rank] [platform]              your online competition
 
-A *separate* top-level group from /wf: nextcord can't extend one cog's group
-from another cog. Registered for both guild installs and user installs, like
-the existing /wf commands.
+Load with:   bot.load_extension("cogs.market_commands")
 """
-
 from __future__ import annotations
 
-import asyncio
-import logging
-from typing import Awaitable, Callable
-
+import aiohttp
 import nextcord
-from nextcord import IntegrationType, InteractionContextType, SlashOption
 from nextcord.ext import commands
 
-from market.analysis import (
-    SetBreakdown,
-    SetPart,
-    build_summary,
-    build_trend,
-    plan_purchase,
-)
-from market.client import (
-    AmbiguousItem,
-    Item,
-    ItemNotFound,
-    MarketError,
-    MarketUnavailable,
-    WarframeMarketClient,
-)
-from market import embeds
+from market.analysis import build_report
+from market.client import ItemNotFound, WarframeMarketClient, MarketError, PLATFORMS
+from market.embeds import report_embed, whisper_embed
 
-log = logging.getLogger("warframebot.market.cog")
-
-RANK_CHOICES = {"Any rank": "any", "Unranked only": "unranked", "Max rank only": "max"}
-PLATFORM_CHOICES = {"PC": "pc", "PlayStation": "ps4", "Xbox": "xbox", "Switch": "switch", "Mobile": "mobile"}
+USER_AND_GUILD = [nextcord.IntegrationType.guild_install, nextcord.IntegrationType.user_install]
+EVERYWHERE = [
+    nextcord.InteractionContextType.guild,
+    nextcord.InteractionContextType.bot_dm,
+    nextcord.InteractionContextType.private_channel,
+]
+PLATFORM_CHOICES = {"PC": "pc", "PlayStation": "ps4", "Xbox": "xbox", "Switch": "switch"}
 
 
-def rank_option() -> str:
-    return SlashOption(
-        description="Mods/arcanes only: which ranks to include",
-        choices=RANK_CHOICES,
-        default="any",
-    )
+def _item_option():
+    return nextcord.SlashOption(description="Item name, e.g. Mirage Prime Set", autocomplete=True)
 
 
-def platform_option() -> str:
-    return SlashOption(description="Platform (default: PC)", choices=PLATFORM_CHOICES, default="pc")
+def _rank_option():
+    return nextcord.SlashOption(description="Mod/arcane rank (0 = unranked, omit for all)",
+                                required=False, min_value=0, max_value=10)
 
 
-def item_option(description: str = "Item name (start typing)", *, required: bool = True) -> str:
-    if required:
-        return SlashOption(description=description, autocomplete=True)
-    return SlashOption(description=description, autocomplete=True, required=False, default=None)
+def _platform_option():
+    return nextcord.SlashOption(description="Platform (default PC)", required=False,
+                                choices=PLATFORM_CHOICES, default="pc")
 
 
 class MarketCommands(commands.Cog):
-    def __init__(self, bot: commands.Bot) -> None:
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._session: aiohttp.ClientSession | None = None
+        self._client: WarframeMarketClient | None = None
 
-    # ---- helpers ---------------------------------------------------------- #
     @property
-    def market(self) -> WarframeMarketClient:
-        client = getattr(self.bot, "market", None)
-        if client is None:
-            raise MarketUnavailable("The market client isn't ready yet; try again in a moment.")
-        return client
+    def client(self) -> WarframeMarketClient:
+        if self._client is None:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+            self._client = WarframeMarketClient(self._session)
+        return self._client
 
-    async def _item(self, query: str) -> Item:
-        return (await self.market.load_items()).resolve(query)
+    def cog_unload(self) -> None:
+        if self._session and not self._session.closed:
+            self.bot.loop.create_task(self._session.close())
 
-    async def _respond(
-        self, interaction: nextcord.Interaction, build: Callable[[], Awaitable[nextcord.Embed]]
-    ) -> None:
-        """Defer, run ``build``, and turn every expected failure into a clean message."""
-        await interaction.response.defer()
+    # --------------------------------------------------------------- group
+    @nextcord.slash_command(name="wm", description="warframe.market tools for sellers",
+                            integration_types=USER_AND_GUILD, contexts=EVERYWHERE)
+    async def wm(self, interaction: nextcord.Interaction):
+        pass  # group only
+
+    async def _fetch(self, interaction, item_q: str, platform: str):
+        """Resolve the item and pull its orders; sends the error itself and returns None on failure."""
         try:
-            embed = await build()
-        except AmbiguousItem as exc:
-            names = "\n".join(f"• {c.name}" for c in exc.candidates)
-            msg = f"**{exc.query}** matches several items. Pick one from the autocomplete list:\n{names}"
-        except ItemNotFound as exc:
-            hint = ""
-            if exc.suggestions:
-                hint = "\nDid you mean: " + ", ".join(s.name for s in exc.suggestions[:5])
-            msg = f"No tradable item found for **{exc.query}**.{hint}"
-        except MarketUnavailable as exc:
-            msg = f"⚠️ {exc}"
+            item = await self.client.resolve_item(item_q)
+            orders = await self.client.get_orders(item.slug, platform=platform)
+            return item, orders
+        except ItemNotFound:
+            await interaction.followup.send(f"No tradable item matches **{item_q}**.")
         except MarketError as exc:
-            msg = f"⚠️ warframe.market error: {exc}"
-        except Exception:  # noqa: BLE001 - never leave an interaction hanging
-            log.exception("Unhandled error in /wfm command")
-            msg = "⚠️ Something went wrong while checking the market."
-        else:
-            await interaction.followup.send(embed=embed)
+            await interaction.followup.send(f"warframe.market problem: {exc}")
+        return None
+
+    @wm.subcommand(name="price", description="Seller dashboard: what to list at, who to sell to, competition")
+    async def price(self, interaction: nextcord.Interaction,
+                    item: str = _item_option(), rank: int = _rank_option(),
+                    platform: str = _platform_option(),
+                    my_price: int = nextcord.SlashOption(
+                        description="Your current/planned price, to see where it ranks",
+                        required=False, min_value=1)):
+        await interaction.response.defer()
+        got = await self._fetch(interaction, item, platform)
+        if not got:
             return
-        await interaction.followup.send(msg, ephemeral=True)
+        it, orders = got
+        history = await self.client.get_history(it.slug)       # None if unavailable
+        report = build_report(it.name, it.slug, orders, rank=rank, history=history)
+        await interaction.followup.send(embed=report_embed(report, it, platform=platform, my_price=my_price))
 
-    async def _summary(self, item: Item, platform: str, rank: str):
-        orders = await self.market.get_orders(item.slug, platform)
-        return build_summary(item, orders, rank_mode=rank)
+    @wm.subcommand(name="buyers", description="Online buyers you can sell to right now (with whispers)")
+    async def buyers(self, interaction: nextcord.Interaction,
+                     item: str = _item_option(), rank: int = _rank_option(),
+                     platform: str = _platform_option()):
+        await interaction.response.defer()
+        got = await self._fetch(interaction, item, platform)
+        if got:
+            it, orders = got
+            await interaction.followup.send(embed=whisper_embed(it, orders, side="buy", rank=rank))
 
-    async def _autocomplete(self, interaction: nextcord.Interaction, query: str) -> None:
+    @wm.subcommand(name="sellers", description="Cheapest online sellers (your competition)")
+    async def sellers(self, interaction: nextcord.Interaction,
+                      item: str = _item_option(), rank: int = _rank_option(),
+                      platform: str = _platform_option()):
+        await interaction.response.defer()
+        got = await self._fetch(interaction, item, platform)
+        if got:
+            it, orders = got
+            await interaction.followup.send(embed=whisper_embed(it, orders, side="sell", rank=rank))
+
+    # --------------------------------------------------------- autocomplete
+    async def _suggest(self, interaction: nextcord.Interaction, current: str) -> None:
         try:
-            index = await asyncio.wait_for(self.market.load_items(), timeout=2.0)
-        except Exception:  # noqa: BLE001 - autocomplete must never raise
-            await interaction.response.send_autocomplete([])
-            return
-        choices = {item.name[:100]: item.slug for item in index.search(query, limit=25)}
-        await interaction.response.send_autocomplete(choices)
+            items = await self.client.search_items(current, 25)
+        except Exception:
+            items = []
+        # label shown == value received; the name resolves back through resolve_item()
+        await interaction.response.send_autocomplete({i.name[:100]: i.name[:100] for i in items})
 
-    # ---- command group ---------------------------------------------------- #
-    @nextcord.slash_command(
-        name="wfm",
-        description="warframe.market prices, availability and trends",
-        integration_types=[IntegrationType.guild_install, IntegrationType.user_install],
-        contexts=[
-            InteractionContextType.guild,
-            InteractionContextType.bot_dm,
-            InteractionContextType.private_channel,
-        ],
-    )
-    async def wfm(self, interaction: nextcord.Interaction) -> None:  # pragma: no cover
-        pass
-
-    # -- /wfm price --------------------------------------------------------- #
-    @wfm.subcommand(name="price", description="Live price check: cheapest sellers, top buyers, spread")
-    async def price(
-        self,
-        interaction: nextcord.Interaction,
-        item: str = item_option(),
-        rank: str = rank_option(),
-        platform: str = platform_option(),
-    ) -> None:
-        async def build() -> nextcord.Embed:
-            it = await self._item(item)
-            summary, stats = await asyncio.gather(
-                self._summary(it, platform, rank),
-                self.market.get_stats(it.slug, platform),
-                return_exceptions=True,
-            )
-            if isinstance(summary, BaseException):
-                raise summary
-            # History is a bonus: v1 stats failing must not break the price check.
-            trend = None if isinstance(stats, BaseException) else build_trend(it, stats, rank)
-            return embeds.price_embed(summary, platform, trend)
-
-        await self._respond(interaction, build)
-
-    # -- /wfm compare ------------------------------------------------------- #
-    @wfm.subcommand(name="compare", description="Compare live prices of 2-4 items side by side")
-    async def compare(
-        self,
-        interaction: nextcord.Interaction,
-        item1: str = item_option("First item"),
-        item2: str = item_option("Second item"),
-        item3: str = item_option("Third item (optional)", required=False),
-        item4: str = item_option("Fourth item (optional)", required=False),
-        rank: str = rank_option(),
-        platform: str = platform_option(),
-    ) -> None:
-        async def build() -> nextcord.Embed:
-            index = await self.market.load_items()
-            resolved = []
-            for q in (item1, item2, item3, item4):
-                if q:
-                    it = index.resolve(q)
-                    if it not in resolved:
-                        resolved.append(it)
-            if len(resolved) < 2:
-                raise MarketError("Pick at least two different items to compare.")
-            summaries = await asyncio.gather(*(self._summary(it, platform, rank) for it in resolved))
-            return embeds.compare_embed(list(summaries), platform)
-
-        await self._respond(interaction, build)
-
-    # -- /wfm available ----------------------------------------------------- #
-    @wfm.subcommand(name="available", description="Is it for sale right now? Optionally within a budget")
-    async def available(
-        self,
-        interaction: nextcord.Interaction,
-        item: str = item_option(),
-        max_price: int = SlashOption(
-            description="Max platinum per unit", required=False, default=None, min_value=1
-        ),
-        quantity: int = SlashOption(
-            description="How many you need (default 1)", required=False, default=1, min_value=1, max_value=99
-        ),
-        rank: str = rank_option(),
-        platform: str = platform_option(),
-    ) -> None:
-        async def build() -> nextcord.Embed:
-            it = await self._item(item)
-            summary = await self._summary(it, platform, rank)
-            plan = plan_purchase(summary.sells, quantity, max_price)
-            return embeds.availability_embed(summary, plan, max_price, platform)
-
-        await self._respond(interaction, build)
-
-    # -- /wfm set ----------------------------------------------------------- #
-    @wfm.subcommand(name="set", description="Compare a Prime set's price with buying its parts")
-    async def set_(
-        self,
-        interaction: nextcord.Interaction,
-        item: str = item_option("Any set or part (e.g. 'Ash Prime Set')"),
-        platform: str = platform_option(),
-    ) -> None:
-        async def build() -> nextcord.Embed:
-            it = await self._item(item)
-            members = await self.market.get_set(it.slug)
-            root = next((m for m in members if m.set_root), None)
-            parts = [m for m in members if not m.set_root]
-            if root is None or not parts:
-                raise MarketError(f"**{it.name}** isn't part of a tradable set.")
-            summaries = await asyncio.gather(
-                *(self._summary(m, platform, "any") for m in [root, *parts])
-            )
-            breakdown = SetBreakdown(
-                root=SetPart(root, 1, summaries[0]),
-                parts=[SetPart(m, m.quantity_in_set, s) for m, s in zip(parts, summaries[1:])],
-            )
-            return embeds.set_embed(breakdown, platform)
-
-        await self._respond(interaction, build)
-
-    # -- /wfm trend --------------------------------------------------------- #
-    @wfm.subcommand(name="trend", description="Price history from closed trades (7d/30d/90d)")
-    async def trend(
-        self,
-        interaction: nextcord.Interaction,
-        item: str = item_option(),
-        rank: str = rank_option(),
-        platform: str = platform_option(),
-    ) -> None:
-        async def build() -> nextcord.Embed:
-            it = await self._item(item)
-            stats = await self.market.get_stats(it.slug, platform)
-            t = build_trend(it, stats, rank)
-            if t is None:
-                raise MarketError(f"No trade history available for **{it.name}**.")
-            return embeds.trend_embed(t, platform)
-
-        await self._respond(interaction, build)
-
-    # ---- autocomplete wiring --------------------------------------------- #
     @price.on_autocomplete("item")
-    async def _ac_price(self, interaction: nextcord.Interaction, query: str) -> None:
-        await self._autocomplete(interaction, query)
+    async def _price_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._suggest(interaction, current)
 
-    @compare.on_autocomplete("item1")
-    async def _ac_c1(self, interaction: nextcord.Interaction, query: str) -> None:
-        await self._autocomplete(interaction, query)
+    @buyers.on_autocomplete("item")
+    async def _buyers_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._suggest(interaction, current)
 
-    @compare.on_autocomplete("item2")
-    async def _ac_c2(self, interaction: nextcord.Interaction, query: str) -> None:
-        await self._autocomplete(interaction, query)
-
-    @compare.on_autocomplete("item3")
-    async def _ac_c3(self, interaction: nextcord.Interaction, query: str) -> None:
-        await self._autocomplete(interaction, query)
-
-    @compare.on_autocomplete("item4")
-    async def _ac_c4(self, interaction: nextcord.Interaction, query: str) -> None:
-        await self._autocomplete(interaction, query)
-
-    @available.on_autocomplete("item")
-    async def _ac_avail(self, interaction: nextcord.Interaction, query: str) -> None:
-        await self._autocomplete(interaction, query)
-
-    @set_.on_autocomplete("item")
-    async def _ac_set(self, interaction: nextcord.Interaction, query: str) -> None:
-        await self._autocomplete(interaction, query)
-
-    @trend.on_autocomplete("item")
-    async def _ac_trend(self, interaction: nextcord.Interaction, query: str) -> None:
-        await self._autocomplete(interaction, query)
+    @sellers.on_autocomplete("item")
+    async def _sellers_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._suggest(interaction, current)
 
 
 def setup(bot: commands.Bot) -> None:

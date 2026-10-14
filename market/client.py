@@ -1,405 +1,255 @@
-"""Async client for the warframe.market public API.
+"""Small async client for the warframe.market public API (v2).
 
-* Items + orders use the **v2** API (``/v2/items``, ``/v2/orders/item/{slug}``,
-  ``/v2/item/{slug}/set``).
-* Price history only exists on the legacy **v1** API
-  (``/v1/items/{slug}/statistics``), so that one call still goes to v1.
+* No API key needed for read-only endpoints.
+* warframe.market asks for <= 3 requests/second, so every call goes through a
+  global limiter, and responses are cached for a short time.
+* Field access is defensive (.get with fallbacks): the API has changed shape
+  before, and one missing key should not take the whole command down.
 
-Everything is rate-limited (~3 req/s, as the API asks), cached with a short
-TTL, de-duplicated while in flight, and retried with backoff on 429/5xx.
-The aiohttp session is passed in, so the bot's existing shared session
-(and its User-Agent) is reused.
+Used by both the Discord cog (cogs/market_commands.py) and the FastAPI app
+(api/main.py), so the two never disagree about the numbers.
 """
-
 from __future__ import annotations
 
 import asyncio
 import difflib
-import logging
 import re
 import time
-from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
-
-import aiohttp
-
-log = logging.getLogger("warframebot.market")
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 API_V2 = "https://api.warframe.market/v2"
 API_V1 = "https://api.warframe.market/v1"
-SITE = "https://warframe.market"
+ASSET_BASE = "https://warframe.market/static/assets/"
+USER_AGENT = "WarframeBOT/1.0 (Discord bot; https://github.com/0xsint/My-Warframe-Bot)"
 
-PLATFORMS = ("pc", "ps4", "xbox", "switch", "mobile")
-ONLINE_STATUSES = frozenset({"ingame", "online"})
-
-# Sent per-request, so it overrides whatever User-Agent the shared session has
-# (the bot's session carries the *wiki* client's UA). Pass user_agent=None to
-# fall back to the session's.
-DEFAULT_USER_AGENT = "WarframeBOT-market/0.1 (Discord bot; +https://github.com/0xsint/My-Warframe-Bot)"
-
-ITEMS_TTL = 6 * 3600  # item catalogue changes rarely
-SET_TTL = 6 * 3600
-ORDERS_TTL = 60  # live orders: keep fresh
-STATS_TTL = 600
+PLATFORMS = ("pc", "ps4", "xbox", "switch")
+ONLINE_STATUSES = {"ingame", "online"}
 
 
-# --------------------------------------------------------------------------- #
-# Errors
-# --------------------------------------------------------------------------- #
 class MarketError(Exception):
-    """Base class for all warframe.market failures."""
-
-
-class MarketUnavailable(MarketError):
-    """Network failure, rate limiting that never cleared, or a Cloudflare block."""
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 class ItemNotFound(MarketError):
-    def __init__(self, query: str, suggestions: list["Item"] | None = None) -> None:
-        super().__init__(query)
-        self.query = query
-        self.suggestions = suggestions or []
+    pass
 
 
-class AmbiguousItem(MarketError):
-    def __init__(self, query: str, candidates: list["Item"]) -> None:
-        super().__init__(query)
-        self.query = query
-        self.candidates = candidates
-
-
-# --------------------------------------------------------------------------- #
-# Models
-# --------------------------------------------------------------------------- #
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Item:
-    id: str
     slug: str
     name: str
+    icon: Optional[str] = None
+    thumb: Optional[str] = None
     tags: tuple[str, ...] = ()
-    set_root: bool = False
-    quantity_in_set: int = 1
-    max_rank: int | None = None
-    ducats: int | None = None
-    vaulted: bool | None = None
+    max_rank: Optional[int] = None
+
+    @property
+    def image_url(self) -> Optional[str]:
+        path = self.icon or self.thumb
+        return ASSET_BASE + path.lstrip("/") if path else None
 
     @property
     def url(self) -> str:
-        return f"{SITE}/items/{self.slug}"
-
-    @classmethod
-    def from_api(cls, d: dict[str, Any], lang: str = "en") -> "Item":
-        i18n = d.get("i18n") or {}
-        loc = i18n.get(lang) or next(iter(i18n.values()), {}) or {}
-        slug = d["slug"]
-        return cls(
-            id=str(d.get("id", slug)),
-            slug=slug,
-            name=loc.get("name") or slug.replace("_", " ").title(),
-            tags=tuple(d.get("tags") or ()),
-            set_root=bool(d.get("setRoot")),
-            quantity_in_set=int(d.get("quantityInSet") or 1),
-            max_rank=d.get("maxRank"),
-            ducats=d.get("ducats"),
-            vaulted=d.get("vaulted"),
-        )
+        return f"https://warframe.market/items/{self.slug}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class Order:
     id: str
-    type: str  # "buy" | "sell"
+    type: str                       # "sell" | "buy"
     platinum: int
     quantity: int
-    rank: int | None
-    status: str  # "ingame" | "online" | "offline" | "invisible"
-    user: str
-    reputation: int
-    platform: str
-    updated_at: str | None = None
+    rank: Optional[int]
+    seller: str                     # in-game name
+    status: str                     # "ingame" | "online" | "offline"
+    reputation: int = 0
+    platform: str = ""
+    crossplay: bool = False
+    updated_at: str = ""
 
     @property
-    def online(self) -> bool:
+    def is_online(self) -> bool:
         return self.status in ONLINE_STATUSES
 
-    @classmethod
-    def from_api(cls, d: dict[str, Any]) -> "Order | None":
-        """Parse one order; returns None for hidden/malformed orders."""
-        try:
-            if d.get("visible") is False:
-                return None
-            user = d.get("user") or {}
-            return cls(
-                id=str(d.get("id", "")),
-                type=str(d.get("type") or d.get("order_type")),
-                platinum=int(d["platinum"]),
-                quantity=max(int(d.get("quantity", 1) or 1), 1),
-                rank=d.get("rank", d.get("mod_rank")),
-                status=str(user.get("status", "offline")),
-                user=str(user.get("ingameName") or user.get("ingame_name") or "?"),
-                reputation=int(user.get("reputation") or 0),
-                platform=str(user.get("platform") or d.get("platform") or ""),
-                updated_at=d.get("updatedAt") or d.get("last_update"),
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+
+def _parse_order(raw: dict[str, Any]) -> Optional[Order]:
+    user = raw.get("user") or {}
+    plat = raw.get("platinum")
+    if plat is None or not raw.get("type"):
+        return None
+    if raw.get("visible") is False:
+        return None
+    return Order(
+        id=str(raw.get("id", "")),
+        type=str(raw["type"]),
+        platinum=int(plat),
+        quantity=int(raw.get("quantity") or 1),
+        rank=raw.get("rank"),
+        seller=str(user.get("ingameName") or user.get("ingame_name") or "unknown"),
+        status=str(user.get("status") or "offline"),
+        reputation=int(user.get("reputation") or 0),
+        platform=str(user.get("platform") or ""),
+        crossplay=bool(user.get("crossplay", False)),
+        updated_at=str(raw.get("updatedAt") or raw.get("last_update") or ""),
+    )
 
 
-# --------------------------------------------------------------------------- #
-# Item index (name -> slug lookup, fuzzy search for autocomplete)
-# --------------------------------------------------------------------------- #
-_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+def _parse_item(raw: dict[str, Any]) -> Optional[Item]:
+    slug = raw.get("slug") or raw.get("url_name")
+    i18n = raw.get("i18n") or {}
+    en = i18n.get("en") or next(iter(i18n.values()), {}) if i18n else {}
+    name = en.get("name") or raw.get("name") or raw.get("item_name") or slug
+    if not slug or not name:
+        return None
+    return Item(
+        slug=slug,
+        name=name,
+        icon=en.get("icon"),
+        thumb=en.get("thumb"),
+        tags=tuple(raw.get("tags") or ()),
+        max_rank=raw.get("maxRank"),
+    )
 
 
-def normalize(text: str) -> str:
-    return _NON_ALNUM.sub(" ", text.lower()).strip()
-
-
-class ItemIndex:
-    def __init__(self, items: list[Item]) -> None:
-        self.items = items
-        self.by_slug = {i.slug: i for i in items}
-        self.by_id = {i.id: i for i in items}
-        self._norm = [(normalize(i.name), i) for i in items]
-        self._by_norm: dict[str, Item] = {}
-        for n, i in self._norm:
-            self._by_norm.setdefault(n, i)
-
-    def __len__(self) -> int:
-        return len(self.items)
-
-    def search(self, query: str, limit: int = 25) -> list[Item]:
-        q = normalize(query)
-        if not q:
-            return []
-        tokens = q.split()
-        exact: list[Item] = []
-        prefix: list[tuple[int, Item]] = []
-        contains: list[tuple[int, Item]] = []
-        for norm, item in self._norm:
-            if norm == q:
-                exact.append(item)
-            elif norm.startswith(q):
-                prefix.append((len(norm), item))
-            elif all(t in norm for t in tokens):
-                contains.append((len(norm), item))
-        prefix.sort(key=lambda t: t[0])
-        contains.sort(key=lambda t: t[0])
-        out = exact + [i for _, i in prefix] + [i for _, i in contains]
-        if len(out) < limit:  # typo tolerance only when needed (it's the slow path)
-            names = [n for n, _ in self._norm]
-            seen = {i.slug for i in out}
-            for n in difflib.get_close_matches(q, names, n=limit, cutoff=0.6):
-                item = self._by_norm[n]
-                if item.slug not in seen:
-                    out.append(item)
-                    seen.add(item.slug)
-        return out[:limit]
-
-    def resolve(self, query: str) -> Item:
-        """Turn user input (slug, exact name, or loose name) into one Item."""
-        raw = query.strip()
-        if raw in self.by_slug:
-            return self.by_slug[raw]
-        q = normalize(raw)
-        if q in self._by_norm:
-            return self._by_norm[q]
-        slug_guess = q.replace(" ", "_")
-        if slug_guess in self.by_slug:
-            return self.by_slug[slug_guess]
-        hits = self.search(raw, limit=6)
-        if not hits:
-            raise ItemNotFound(raw)
-        if len(hits) == 1:
-            return hits[0]
-        # Several plausible matches: don't guess on a price check.
-        norm_hits = [normalize(h.name) for h in hits]
-        starts = [h for h, n in zip(hits, norm_hits) if n.startswith(q)]
-        if len(starts) == 1:
-            return starts[0]
-        raise AmbiguousItem(raw, hits[:5])
-
-
-# --------------------------------------------------------------------------- #
-# Client
-# --------------------------------------------------------------------------- #
-_MISS = object()
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
 class WarframeMarketClient:
-    def __init__(
-        self,
-        session: aiohttp.ClientSession,
-        *,
-        platform: str = "pc",
-        language: str = "en",
-        crossplay: bool = True,
-        min_interval: float = 0.35,
-        max_retries: int = 3,
-        user_agent: str | None = DEFAULT_USER_AGENT,
-    ) -> None:
-        self._session = session
+    """Create once, share everywhere. Pass an aiohttp.ClientSession you manage."""
+
+    def __init__(self, session, *, platform: str = "pc", crossplay: bool = True,
+                 language: str = "en", cache_ttl: float = 60.0, min_interval: float = 0.34):
+        self.session = session
         self.platform = platform
-        self.language = language
         self.crossplay = crossplay
-        self.min_interval = min_interval
-        self.max_retries = max_retries
-        self.user_agent = user_agent
-        self._next_slot = 0.0
-        self._cache: dict[Any, tuple[float, Any]] = {}
-        self._inflight: dict[Any, asyncio.Future] = {}
-        self._stale_index: ItemIndex | None = None
+        self.language = language
+        self.cache_ttl = cache_ttl
+        self._min_interval = min_interval
+        self._lock = asyncio.Lock()
+        self._last_call = 0.0
+        self._cache: dict[tuple, tuple[float, Any]] = {}
+        self._items: list[Item] = []
+        self._items_loaded = 0.0
+        self._items_lock = asyncio.Lock()
 
-    # ---- plumbing --------------------------------------------------------- #
-    def _reserve_slot(self) -> float:
-        """Reserve the next request slot; returns seconds to wait for it."""
-        now = time.monotonic()
-        slot = max(now, self._next_slot)
-        self._next_slot = slot + self.min_interval
-        return slot - now
-
-    def _cache_get(self, key: Any) -> Any:
+    # ------------------------------------------------------------- transport
+    async def _get(self, url: str, *, params: dict | None = None, platform: str | None = None,
+                   crossplay: bool | None = None, ttl: float | None = None) -> Any:
+        platform = platform or self.platform
+        crossplay = self.crossplay if crossplay is None else crossplay
+        key = (url, tuple(sorted((params or {}).items())), platform, crossplay)
+        ttl = self.cache_ttl if ttl is None else ttl
         hit = self._cache.get(key)
-        if hit and hit[0] > time.monotonic():
+        if hit and time.monotonic() - hit[0] < ttl:
             return hit[1]
-        self._cache.pop(key, None)
-        return _MISS
 
-    def _cache_set(self, key: Any, value: Any, ttl: float) -> None:
-        if len(self._cache) > 1000:  # crude bound; entries are small
-            now = time.monotonic()
-            self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
-        self._cache[key] = (time.monotonic() + ttl, value)
-
-    async def _cached(self, key: Any, ttl: float, fetch: Callable[[], Awaitable[Any]]) -> Any:
-        hit = self._cache_get(key)
-        if hit is not _MISS:
-            return hit
-        task = self._inflight.get(key)
-        if task is None:
-            task = asyncio.ensure_future(fetch())
-            self._inflight[key] = task
-
-            def _done(t: asyncio.Future, k: Any = key) -> None:
-                self._inflight.pop(k, None)
-                if not t.cancelled():
-                    t.exception()  # mark retrieved; callers see it via await
-
-            task.add_done_callback(_done)
-        # shield: one caller timing out (e.g. autocomplete) must not kill the
-        # shared request that other callers are awaiting.
-        value = await asyncio.shield(task)
-        self._cache_set(key, value, ttl)
-        return value
-
-    async def _request(
-        self, version: str, path: str, *, platform: str | None = None
-    ) -> Any:
-        base = API_V2 if version == "v2" else API_V1
-        url = f"{base}{path}"
         headers = {
-            "Accept": "application/json",
-            "Language": self.language,
-            "Platform": platform or self.platform,
-            "Crossplay": "true" if self.crossplay else "false",
+            "User-Agent": USER_AGENT, "Accept": "application/json",
+            "Language": self.language, "Platform": platform,
+            "Crossplay": "true" if crossplay else "false",
         }
-        if self.user_agent:
-            headers["User-Agent"] = self.user_agent
-        last: str = "unknown error"
-        for attempt in range(1, self.max_retries + 1):
-            await asyncio.sleep(self._reserve_slot())
+        async with self._lock:                       # global rate limit
+            wait = self._min_interval - (time.monotonic() - self._last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
             try:
-                async with self._session.get(
-                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
+                async with self.session.get(url, params=params, headers=headers) as resp:
+                    self._last_call = time.monotonic()
                     if resp.status == 404:
-                        raise MarketError("warframe.market has no data for that item (HTTP 404).")
-                    if resp.status == 403:
-                        try:
-                            snippet = " ".join((await resp.text())[:300].split())
-                        except Exception:  # noqa: BLE001 - diagnostics only
-                            snippet = "<unreadable>"
-                        log.error(
-                            "HTTP 403 from %s | server=%s cf-ray=%s cf-mitigated=%s | body: %s",
-                            url, resp.headers.get("Server"), resp.headers.get("CF-RAY"),
-                            resp.headers.get("cf-mitigated"), snippet,
-                        )
-                        raise MarketUnavailable(
-                            "warframe.market refused the request (HTTP 403). This is usually "
-                            "bot protection blocking this IP or request; see the bot log for details."
-                        )
-                    if resp.status == 429 or resp.status >= 500:
-                        last = f"HTTP {resp.status}"
-                        retry_after = resp.headers.get("Retry-After", "")
-                        delay = float(retry_after) if retry_after.isdigit() else 1.5 * attempt
-                        log.warning("%s on %s (attempt %d); backing off %.1fs",
-                                    last, path, attempt, delay)
-                        await asyncio.sleep(min(delay, 30))
-                        continue
+                        raise ItemNotFound("Not found on warframe.market", 404)
+                    if resp.status == 429:
+                        raise MarketError("warframe.market rate limit hit, try again in a moment", 429)
                     if resp.status >= 400:
-                        raise MarketError(f"warframe.market returned HTTP {resp.status}.")
-                    return await resp.json(content_type=None)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last = f"{type(exc).__name__}: {exc}"
-                log.warning("Network error on %s (attempt %d): %s", path, attempt, last)
-                await asyncio.sleep(0.8 * attempt)
-        raise MarketUnavailable(f"warframe.market is not responding ({last}).")
+                        raise MarketError(f"warframe.market returned HTTP {resp.status}", resp.status)
+                    data = await resp.json()
+            except MarketError:
+                raise
+            except asyncio.TimeoutError as exc:
+                raise MarketError("warframe.market timed out") from exc
+            except Exception as exc:                 # aiohttp.ClientError etc.
+                raise MarketError(f"Could not reach warframe.market: {exc}") from exc
 
-    @staticmethod
-    def _unwrap(body: Any) -> Any:
-        if isinstance(body, dict):
-            if "data" in body:
-                return body["data"]
-            if "payload" in body:  # v1
-                return body["payload"]
-        return body
+        self._cache[key] = (time.monotonic(), data)
+        if len(self._cache) > 500:                   # crude bound on memory
+            oldest = sorted(self._cache, key=lambda k: self._cache[k][0])[:100]
+            for k in oldest:
+                self._cache.pop(k, None)
+        return data
 
-    # ---- public API ------------------------------------------------------- #
-    async def load_items(self) -> ItemIndex:
-        async def fetch() -> ItemIndex:
-            raw = self._unwrap(await self._request("v2", "/items"))
-            items = [Item.from_api(d, self.language) for d in raw if d.get("slug")]
-            log.info("Loaded %d tradable items from warframe.market", len(items))
-            return ItemIndex(items)
+    # ----------------------------------------------------------------- items
+    async def _load_items(self) -> list[Item]:
+        async with self._items_lock:
+            if self._items and time.monotonic() - self._items_loaded < 6 * 3600:
+                return self._items
+            data = await self._get(f"{API_V2}/items", ttl=0)
+            items = [i for i in (_parse_item(r) for r in data.get("data", [])) if i]
+            if items:
+                self._items, self._items_loaded = items, time.monotonic()
+            return self._items
 
+    async def search_items(self, query: str, limit: int = 10) -> list[Item]:
+        items = await self._load_items()
+        q = _norm(query)
+        if not q:
+            return items[:limit]
+        scored: list[tuple[float, Item]] = []
+        for it in items:
+            n = _norm(it.name)
+            if n == q or _norm(it.slug) == q:
+                score = 100
+            elif n.startswith(q):
+                score = 80 - min(len(n) - len(q), 40) / 2
+            elif q in n:
+                score = 60 - min(n.index(q), 30) / 2
+            elif all(tok in n for tok in q.split()):
+                score = 50
+            else:
+                continue
+            scored.append((score, it))
+        scored.sort(key=lambda s: (-s[0], len(s[1].name)))
+        results = [it for _, it in scored[:limit]]
+        if not results:                              # typo tolerance
+            names = {_norm(it.name): it for it in items}
+            for m in difflib.get_close_matches(q, list(names), n=limit, cutoff=0.6):
+                results.append(names[m])
+        return results
+
+    async def resolve_item(self, query_or_slug: str) -> Item:
+        found = await self.search_items(query_or_slug, 1)
+        if not found:
+            raise ItemNotFound(f"No tradable item matches '{query_or_slug}'", 404)
+        return found[0]
+
+    # ---------------------------------------------------------------- orders
+    async def get_orders(self, slug: str, *, platform: str | None = None,
+                         crossplay: bool | None = None) -> list[Order]:
+        data = await self._get(f"{API_V2}/orders/item/{slug}", platform=platform, crossplay=crossplay)
+        raw = data.get("data", [])
+        if isinstance(raw, dict):                    # some responses nest buy/sell
+            raw = [*raw.get("sell", []), *raw.get("buy", [])]
+        return [o for o in (_parse_order(r) for r in raw) if o]
+
+    async def get_history(self, slug: str) -> Optional[dict]:
+        """48h sales summary from the v1 statistics endpoint (best effort: this
+        endpoint is older and may change; returns None on any problem)."""
         try:
-            index = await self._cached(("items", self.language), ITEMS_TTL, fetch)
-        except MarketError:
-            if self._stale_index is not None:
-                log.warning("Item refresh failed; serving stale item index.")
-                return self._stale_index
-            raise
-        self._stale_index = index
-        return index
-
-    async def get_orders(self, slug: str, platform: str | None = None) -> list[Order]:
-        platform = platform or self.platform
-
-        async def fetch() -> list[Order]:
-            raw = self._unwrap(await self._request("v2", f"/orders/item/{slug}", platform=platform))
-            return [o for o in (Order.from_api(d) for d in raw or []) if o is not None]
-
-        return await self._cached(("orders", slug, platform), ORDERS_TTL, fetch)
-
-    async def get_set(self, slug: str) -> list[Item]:
-        """All items in the set containing ``slug`` (root + parts), or [] if none."""
-
-        async def fetch() -> list[Item]:
-            data = self._unwrap(await self._request("v2", f"/item/{slug}/set")) or {}
-            return [Item.from_api(d, self.language) for d in data.get("items", [])]
-
-        return await self._cached(("set", slug), SET_TTL, fetch)
-
-    async def get_stats(self, slug: str, platform: str | None = None) -> dict[str, list[dict]]:
-        """Closed-trade history: {"48hours": [...], "90days": [...]} (v1 endpoint)."""
-        platform = platform or self.platform
-
-        async def fetch() -> dict[str, list[dict]]:
-            data = self._unwrap(await self._request("v1", f"/items/{slug}/statistics", platform=platform)) or {}
-            closed = data.get("statistics_closed") or {}
-            return {
-                "48hours": closed.get("48hours") or closed.get("hours_48") or [],
-                "90days": closed.get("90days") or closed.get("days_90") or [],
-            }
-
-        return await self._cached(("stats", slug, platform), STATS_TTL, fetch)
+            data = await self._get(f"{API_V1}/items/{slug}/statistics", ttl=300)
+            rows = data["payload"]["statistics_closed"]["48hours"]
+        except Exception:
+            return None
+        if not rows:
+            return None
+        volume = sum(int(r.get("volume") or 0) for r in rows)
+        if volume == 0:
+            return {"volume_48h": 0, "avg_price_48h": None, "median_48h": None}
+        weighted = sum(float(r.get("avg_price") or 0) * int(r.get("volume") or 0) for r in rows)
+        medians = sorted(float(r["median"]) for r in rows if r.get("median") is not None)
+        return {
+            "volume_48h": volume,
+            "avg_price_48h": round(weighted / volume, 1),
+            "median_48h": medians[len(medians) // 2] if medians else None,
+        }
