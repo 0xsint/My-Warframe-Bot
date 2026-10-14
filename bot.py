@@ -21,11 +21,11 @@ from wiki.client import USER_AGENT, WarframeWikiClient
 load_dotenv()
 
 logging.basicConfig(
+    filename="log.log",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 log = logging.getLogger("warframebot")
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = nextcord.Intents.default()
@@ -47,12 +47,13 @@ class WarframeBot(commands.Bot):
         self._http_session = None
         self.load_extension("cogs.wiki_commands")
         self.load_extension("cogs.market_commands")       # new
+        self.load_extension("cogs.ability_commands")
 
     async def start(self, token, *, reconnect=True):
         self._http_session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
         self.wiki = WarframeWikiClient(self._http_session)
         self.market = WarframeMarketClient(self._http_session)          # new
-        asyncio.create_task(self.market.load_items())  # new: warm autocomplete (add `import asyncio`)
+        asyncio.create_task(self.market._load_items())  # new: warm autocomplete (add `import asyncio`)
         await super().start(token, reconnect=reconnect)
     async def close(self) -> None:
         if self._http_session is not None and not self._http_session.closed:

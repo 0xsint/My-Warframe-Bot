@@ -79,6 +79,7 @@ class WarframeWikiClient:
 
     def _set_cached(self, key: str, value: Any, ttl: float) -> None:
         self._cache[key] = _CacheEntry(value, time.monotonic() + ttl)
+        print(key)
 
     # -- low level request -------------------------------------------------
 
