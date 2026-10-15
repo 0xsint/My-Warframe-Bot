@@ -1,0 +1,199 @@
+==============================================================================
+WarframeBOT - ENVIRONMENT VARIABLES
+==============================================================================
+
+All configuration is read from environment variables. For the Discord bot,
+bot.py calls load_dotenv() at startup, so a file named ".env" in the project
+root (next to bot.py) is loaded automatically.
+
+Setup:
+  1. Copy .env.example to .env
+  2. Fill in the values below
+  3. Start the bot:  python bot.py
+
+NEVER commit your real .env file. Add ".env" to .gitignore.
+
+Summary
+-------
+  Variable          Used by          Required?
+  ----------------  ---------------  --------------------------------------
+  DISCORD_TOKEN     bot.py           YES (bot exits without it)
+  OWNER_ID          /wm owner cmds   YES for /wm list, update_order, unlist,
+                                     my_orders (otherwise nobody is allowed)
+  WFM_JWT           market/seller    Needed for owner commands (preferred)
+  WFM_EMAIL         market/seller    Alternative to WFM_JWT
+  WFM_PASSWORD      market/seller    Alternative to WFM_JWT
+  WFBOT_API_KEY     FastAPI service  No (API is open if unset)
+  WFBOT_CORS        FastAPI service  No (defaults to "*")
+
+
+------------------------------------------------------------------------------
+DISCORD BOT
+------------------------------------------------------------------------------
+
+DISCORD_TOKEN
+    Description : Bot token for your Discord application.
+    Required    : Yes. If it is missing, bot.py logs an error and exits.
+    Type        : String
+    Example     : DISCORD_TOKEN="your-bot-token-here"
+    Where to get: https://discord.com/developers/applications
+                  -> your application -> "Bot" tab -> "Reset Token"
+                  (shown only once, so copy it immediately)
+    Security    : Treat it like a password. If it leaks, reset it in the
+                  Developer Portal and update .env.
+
+OWNER_ID
+    Description : Discord user ID(s) allowed to run the owner-only /wm
+                  commands: /wm list, /wm update_order, /wm unlist and
+                  /wm my_orders. These act on YOUR warframe.market account.
+                  Because the bot is a user-installable app, anyone can run
+                  its commands, so this gate is what protects your account.
+    Required    : Yes, if you use those commands. If unset or empty, nobody
+                  passes the check and every owner command is refused.
+    Type        : One user ID, or several separated by commas. Non-numeric
+                  entries are ignored; spaces are removed.
+    Example     : OWNER_ID="123456789012345678"
+                  OWNER_ID="123456789012345678,987654321098765432"
+    Where to get: Discord -> Settings -> Advanced -> enable Developer Mode,
+                  then right-click your name -> "Copy User ID".
+
+
+------------------------------------------------------------------------------
+WARFRAME.MARKET ACCOUNT (owner-only listing commands)
+------------------------------------------------------------------------------
+
+Used by market/seller.py (MarketSeller). The seller is "configured" when
+WFM_JWT is set, OR when both WFM_EMAIL and WFM_PASSWORD are set. If neither
+is set, the owner commands reply "Listing isn't set up".
+
+Order of preference: WFM_JWT first, then WFM_EMAIL + WFM_PASSWORD.
+
+WFM_JWT
+    Description : Session token for your warframe.market account. Preferred
+                  because password sign-in can be blocked by Cloudflare.
+    Required    : No (but you need this OR the email/password pair for any
+                  command that touches your account).
+    Type        : String
+    Example     : WFM_JWT="eyJ0eXAiOiJKV1Qi..."
+    Where to get: Sign in at https://warframe.market in your browser and copy
+                  the value of the "JWT" cookie.
+    Note        : A token supplied this way cannot be refreshed
+                  automatically. When it expires you must paste a new one.
+
+WFM_EMAIL
+    Description : Email for password sign-in to warframe.market.
+    Required    : Only if you are not using WFM_JWT (needs WFM_PASSWORD too).
+    Example     : WFM_EMAIL="you@example.com"
+
+WFM_PASSWORD
+    Description : Password for password sign-in to warframe.market.
+    Required    : Only if you are not using WFM_JWT (needs WFM_EMAIL too).
+    Example     : WFM_PASSWORD="your-password"
+    Security    : Stored in plain text in .env. Prefer WFM_JWT.
+
+Heads-up: password sign-in also opens a background WebSocket connection to
+warframe.market and sets your status to "ingame" (details "Void Fissure")
+for 1200 seconds. This is what market/seller.py does after a successful
+login.
+
+
+------------------------------------------------------------------------------
+FASTAPI SERVICE (uvicorn)
+------------------------------------------------------------------------------
+
+The API does NOT call load_dotenv(). Values in .env are not picked up
+automatically. Either export the variables in your shell, or start uvicorn
+with:   uvicorn api.main:app --env-file .env
+
+WFBOT_API_KEY
+    Description : When set, every /v1/* endpoint requires the header
+                  "X-API-Key: <this value>". Requests without it, or with
+                  the wrong value, get HTTP 401. /health is always open.
+    Required    : No. If unset, the API is unauthenticated.
+    Type        : String (choose a long random value)
+    Example     : WFBOT_API_KEY="3f9c0d1e-replace-me"
+
+WFBOT_CORS
+    Description : Allowed CORS origins, comma-separated.
+    Required    : No.
+    Default     : "*" (any origin)
+    Example     : WFBOT_CORS="https://example.com,https://app.example.com"
+    Note        : Only GET requests are allowed by the CORS configuration.
+
+
+------------------------------------------------------------------------------
+EXAMPLE .env
+------------------------------------------------------------------------------
+
+# --- Discord bot ---
+DISCORD_TOKEN="your-bot-token-here"
+OWNER_ID="your-discord-user-id"
+
+# --- warframe.market account (owner commands). Use JWT OR email+password ---
+WFM_JWT=""
+WFM_EMAIL=""
+WFM_PASSWORD=""
+
+# --- FastAPI service (optional) ---
+WFBOT_API_KEY=""
+WFBOT_CORS="*"
+
+(The shipped .env.example currently lists DISCORD_TOKEN, WFM_PASSWORD,
+WFM_EMAIL and OWNER_ID. WFM_JWT, WFBOT_API_KEY and WFBOT_CORS are read by
+the code but are not in that file yet.)
+
+
+------------------------------------------------------------------------------
+EXAMPLE .gitignore ENTRIES
+------------------------------------------------------------------------------
+
+.env
+.venv/
+__pycache__/
+*.log
+pyvenv.cfg
+_tmp_*
+
+
+------------------------------------------------------------------------------
+NOT ENVIRONMENT VARIABLES (hard-coded in the source)
+------------------------------------------------------------------------------
+
+These are constants in the code, not configurable through .env:
+
+  wiki/client.py     search cache 300 s, page cache 900 s,
+                     4 concurrent requests, 15 s timeout
+  market/client.py   cache 60 s, min 0.34 s between requests,
+                     item list refreshed every 6 h, 48h-history cache 300 s
+  market/seller.py   min 0.4 s between requests
+  wiki_commands.py   autocomplete shows up to 10 suggestions
+  ability_view.py    dropdown/buttons time out after 600 s
+
+
+------------------------------------------------------------------------------
+TROUBLESHOOTING
+------------------------------------------------------------------------------
+
+"DISCORD_TOKEN is not set"
+    The variable is missing or .env is not in the folder you launched the
+    bot from. Check the file is named exactly ".env" (not ".env.txt").
+
+Login fails / improper token
+    Token is mistyped, has stray spaces, or was reset. Generate a new one.
+
+"You're not allowed to post listings" (or update / remove / view)
+    Your Discord user ID is not in OWNER_ID.
+
+"Listing isn't set up: add WFM_JWT (or WFM_EMAIL + WFM_PASSWORD) to .env"
+    The seller has no credentials. Set WFM_JWT, or both WFM_EMAIL and
+    WFM_PASSWORD, then restart the bot.
+
+API returns 401 "Missing or invalid X-API-Key"
+    WFBOT_API_KEY is set. Send the header  X-API-Key: <value>.
+
+API ignores my .env
+    uvicorn does not read .env by itself. Use --env-file .env or export the
+    variables.
+
+Bot starts but /wf never appears
+    Not an environment problem. See README.md, "Troubleshooting".
