@@ -90,9 +90,9 @@ class WikiCommands(commands.Cog):
             return
         except Exception:
             # log.exception already records the full traceback. To also keep it in
-            # error.log, attach a (rotating) FileHandler to the "warframebot"
+            # log.log, attach a (rotating) FileHandler to the "warframebot"
             # logger in bot.py instead of opening the file by hand here.
-            log.exception("Unexpected error looking up %r", name)
+            log.exception("Unexpected error looking up %r", name) # Log the full traceback for debugging purposes
             await interaction.send(
                 embed=build_error_embed(
                     "Something went wrong",
@@ -147,7 +147,7 @@ class WikiCommands(commands.Cog):
     async def wf(self, interaction: Interaction) -> None:
         """Base command group; Discord only invokes registered subcommands."""
 
-    @wf.subcommand(name="warframe", description="Look up a Warframe's stats, passive, and abilities")
+    @wf.subcommand(name="warframe", description="Look up a Warframe's stats, passive, and abilities [BETA]")
     async def wf_warframe(
         self,
         interaction: Interaction,

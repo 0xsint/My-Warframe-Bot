@@ -47,7 +47,6 @@ class WarframeBot(commands.Bot):
         self._http_session = None
         self.load_extension("cogs.wiki_commands")
         self.load_extension("cogs.market_commands")       # new
-        self.load_extension("cogs.ability_commands")
 
     async def start(self, token, *, reconnect=True):
         self._http_session = aiohttp.ClientSession(headers={"User-Agent": USER_AGENT})
