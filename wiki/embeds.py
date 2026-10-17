@@ -177,7 +177,7 @@ def build_generic_embed(page: WikiPage) -> nextcord.Embed:
     return embed
 
 
-def build_search_embed(query: str, results: list[tuple[str, str]]) -> nextcord.Embed:
+def build_search_embed(query: str, results: list[tuple[str, str]], *, start: int = 1) -> nextcord.Embed:
     embed = nextcord.Embed(
         title=f'Search results for "{query}"',
         color=EMBED_COLOR,
@@ -187,7 +187,7 @@ def build_search_embed(query: str, results: list[tuple[str, str]]) -> nextcord.E
         embed.description = "No matching pages were found on the WARFRAME Wiki."
         return embed
 
-    lines = [f"{i}. [{title}]({url})" for i, (title, url) in enumerate(results, start=1)]
+    lines = [f"{i}. [{title}]({url})" for i, (title, url) in enumerate(results, start=start)]
     embed.description = _truncate("\n".join(lines), DESCRIPTION_LIMIT)
     return embed
 

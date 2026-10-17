@@ -235,31 +235,8 @@ def _find_image_in_html(title: str, soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
-PAGE_CHARS = 3800  # Discord embed description hard limit is 4096
-
-
-def paginate(lines: list[str], limit: int = PAGE_CHARS) -> list[str]:
-    """Pack markdown lines into chunks <= limit chars without splitting a line
-    (unless a single line is longer than the limit)."""
-    pages: list[str] = []
-    buf = ""
-    for line in lines:
-        while len(line) > limit:                       # pathological long line
-            cut = line.rfind(" ", 0, limit)
-            if cut <= 0:
-                cut = limit
-            if buf:
-                pages.append(buf)
-                buf = ""
-            pages.append(line[:cut])
-            line = line[cut:].lstrip()
-        if len(buf) + len(line) + 1 > limit and buf:
-            pages.append(buf)
-            buf = ""
-        buf += line + "\n"
-    if buf.strip():
-        pages.append(buf)
-    return [p.rstrip() for p in pages]
+# kept under the old names so existing imports (ability_view) keep working
+from ui.text import PAGE_CHARS, paginate_lines as paginate  # noqa: E402,F401
 
 
 # --------------------------------------------------------------------------- #

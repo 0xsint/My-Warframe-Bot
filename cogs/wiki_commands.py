@@ -11,7 +11,7 @@ never added to.
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Optional
 
 import nextcord
 from nextcord import Interaction, IntegrationType, InteractionContextType, SlashOption
@@ -21,14 +21,11 @@ from http_session import SessionProvider
 from wiki import PageNotFoundError, WikiError
 from wiki.ability import fetch_ability, is_ability_title
 from wiki.ability_view import AbilityView
-from wiki.embeds import (
-    build_error_embed,
-    build_generic_embed,
-    build_search_embed,
-    build_warframe_embed,
-    build_weapon_embed,
-)
+from wiki.embeds import build_error_embed, build_search_embed
+from wiki.page_view import build_page_view
 from wiki.parser import WikiPage
+from wiki.search_view import SearchView
+from ui.paginator import view_kwargs
 
 log = logging.getLogger("warframebot.cogs.wiki")
 
@@ -40,6 +37,7 @@ _CONTEXTS = [
 ]
 
 AUTOCOMPLETE_LIMIT = 10
+SEARCH_LIMIT = 50   # MediaWiki's opensearch maximum for non-bot clients
 
 
 class WikiCommands(commands.Cog):
@@ -70,38 +68,55 @@ class WikiCommands(commands.Cog):
             return
         await interaction.response.send_autocomplete([title for title, _ in results])
 
+    async def _load_page(self, name: str) -> tuple[Optional[WikiPage], Optional[nextcord.Embed]]:
+        """Fetch + parse a page. Returns ``(page, None)`` or ``(None, error_embed)``."""
+        try:
+            return await self.bot.wiki.fetch(name), None
+        except PageNotFoundError as exc:
+            return None, build_error_embed("Page not found", str(exc))
+        except WikiError as exc:
+            return None, build_error_embed("WARFRAME Wiki error", str(exc))
+        except Exception:
+            # log.exception already records the full traceback.
+            log.exception("Unexpected error looking up %r", name)
+            return None, build_error_embed(
+                "Something went wrong",
+                "An unexpected error occurred while reading that page. Please try again later.",
+            )
+
     async def _respond_with_page(
         self,
         interaction: Interaction,
         name: str,
-        builder: Callable[[WikiPage], nextcord.Embed],
+        kind: Optional[str] = None,
         *,
         deferred: bool = False,
     ) -> None:
+        """Send a wiki page as an overview + dropdown + pagination view.
+        ``kind`` is "warframe" / "weapon" / "generic"; None auto-detects."""
         if not deferred:
             await interaction.response.defer()
-        try:
-            page = await self.bot.wiki.fetch(name)
-        except PageNotFoundError as exc:
-            await interaction.send(embed=build_error_embed("Page not found", str(exc)), ephemeral=True)
+        page, error = await self._load_page(name)
+        if error is not None:
+            await interaction.send(embed=error, ephemeral=True)
             return
-        except WikiError as exc:
-            await interaction.send(embed=build_error_embed("WARFRAME Wiki error", str(exc)), ephemeral=True)
-            return
-        except Exception:
-            # log.exception already records the full traceback. To also keep it in
-            # log.log, attach a (rotating) FileHandler to the "warframebot"
-            # logger in bot.py instead of opening the file by hand here.
-            log.exception("Unexpected error looking up %r", name) # Log the full traceback for debugging purposes
-            await interaction.send(
-                embed=build_error_embed(
-                    "Something went wrong",
-                    "An unexpected error occurred while reading that page. Please try again later.",
-                ),
-                ephemeral=True,
-            )
-            return
-        await interaction.send(embed=builder(page))
+        view = build_page_view(page, kind)
+        view.message = await interaction.send(**view_kwargs(view))
+
+    async def _open_from_search(self, interaction: Interaction, title: str) -> None:
+        """A result was picked in /wf search: turn that same message into the page."""
+        await interaction.response.defer()
+        ability = await self._resolve_ability(title)
+        if ability is not None:
+            view = AbilityView(ability)
+        else:
+            page, error = await self._load_page(title)
+            if error is not None:
+                await interaction.followup.send(embed=error, ephemeral=True)
+                return
+            view = build_page_view(page)
+        view.message = await interaction.edit_original_message(
+            embed=view.current_embed(), view=view if view.children else None)
 
     # -- ability pages ------------------------------------------------------
 
@@ -153,7 +168,7 @@ class WikiCommands(commands.Cog):
         interaction: Interaction,
         name: str = SlashOption(description="Warframe name, e.g. Excalibur", autocomplete=True),
     ) -> None:
-        await self._respond_with_page(interaction, name, build_warframe_embed)
+        await self._respond_with_page(interaction, name, "warframe")
 
     @wf_warframe.on_autocomplete("name")
     async def wf_warframe_autocomplete(self, interaction: Interaction, current: str) -> None:
@@ -193,7 +208,7 @@ class WikiCommands(commands.Cog):
         interaction: Interaction,
         name: str = SlashOption(description="Weapon name, e.g. Braton", autocomplete=True),
     ) -> None:
-        await self._respond_with_page(interaction, name, build_weapon_embed)
+        await self._respond_with_page(interaction, name, "weapon")
 
     @wf_weapon.on_autocomplete("name")
     async def wf_weapon_autocomplete(self, interaction: Interaction, current: str) -> None:
@@ -210,12 +225,12 @@ class WikiCommands(commands.Cog):
     ) -> None:
         await interaction.response.defer()
         # Ability pages get the rich view (stats, Info, Kit Interactions, Tips, icon);
-        # everything else - or any failure - falls through to the generic embed.
+        # everything else gets the sectioned view (kind auto-detected from the infobox).
         ability = await self._resolve_ability(name)
         if ability is not None:
             await self._send_ability(interaction, ability)
             return
-        await self._respond_with_page(interaction, name, build_generic_embed, deferred=True)
+        await self._respond_with_page(interaction, name, deferred=True)
 
     @wf_page.on_autocomplete("name")
     async def wf_page_autocomplete(self, interaction: Interaction, current: str) -> None:
@@ -229,11 +244,15 @@ class WikiCommands(commands.Cog):
     ) -> None:
         await interaction.response.defer()
         try:
-            results = await self.bot.wiki.search(query, limit=10)
+            results = await self.bot.wiki.search(query, limit=SEARCH_LIMIT)
         except WikiError as exc:
             await interaction.send(embed=build_error_embed("Search failed", str(exc)), ephemeral=True)
             return
-        await interaction.send(embed=build_search_embed(query, results))
+        if not results:
+            await interaction.send(embed=build_search_embed(query, results))
+            return
+        view = SearchView(query, results, self._open_from_search)
+        view.message = await interaction.send(**view_kwargs(view))
 
 
 def setup(bot: commands.Bot) -> None:

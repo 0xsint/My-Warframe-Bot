@@ -106,20 +106,22 @@ Two slash command groups are registered globally, usable in servers, DMs and gro
 
 All `name` options have live autocomplete (up to 10 wiki title suggestions). Names are resolved with fuzzy wiki search, so partial names and typos usually work.
 
+Every wiki lookup below (`warframe`, `weapon`, `page`, and picked `search` results) uses the same view as `/wf ability`: an **Overview** embed, a **dropdown** listing every other block of the page (infobox groups such as *General Information* and *Abilities*, then article headings such as *Acquisition* and *Trivia*), and **Prev/Next** buttons for sections too long for one embed. The footer shows the section and page number, and controls are disabled after 10 minutes. Pages with nothing beyond the overview just show the overview.
+
 #### `/wf warframe name:<Warframe>`
-Shows the description and passive, a **Stats** field (Mastery Rank, Health, Shields, Armor, Energy, Starting Energy, Sprint Speed, Aura Polarity, Exilus Polarity, Introduced) and an **Abilities** field. Marked `[BETA]` in Discord.
+Overview: description and passive, a **Stats** field and an **Abilities** field. The dropdown puts *General Information* and *Abilities* first, then everything else on the page. Marked `[BETA]` in Discord.
 
 #### `/wf ability name:<ability>`
 Rich view for a Warframe ability (for example *Nurinarim* or *Molecular Prime*): description, energy cost, introduced date, Strength/Duration/Range/Misc stats, and the ability icon. A dropdown switches between **Overview** and any of **Info, Kit Interactions, Synergies, Tips, Notes, Trivia, Bugs** the page has; Prev/Next buttons page through long sections. Controls are disabled after 10 minutes. If the page isn't in the wiki's *Warframe Abilities* category you get a "Not an ability page" error.
 
 #### `/wf weapon name:<Weapon>`
-General Information (Type, Mastery Rank, Slot, Trigger Type, Accuracy, Magazine Size, Reload Time, Noise Level), a Utility block, and one field per remaining infobox section (attack modes such as Normal, Charged, Heavy, Incarnon), up to Discord's 25-field limit.
+Overview: General Information and the Utility block. The dropdown lists General Information, Utility and the attack modes (Normal, Charged, Heavy, Incarnon, ...) first, then the article sections.
 
 #### `/wf page name:<page>`
-Generic lookup. Ability pages automatically get the rich ability view; everything else gets the page summary plus up to four infobox sections (8 rows each).
+Generic lookup. Ability pages get the ability view; Warframe and weapon pages are detected from their infobox and get the matching overview; anything else gets a summary overview. Every page gets the section dropdown.
 
 #### `/wf search query:<text>`
-Lists up to 10 matching page titles as numbered links.
+Up to 50 matching titles, 10 per page, as numbered links. The dropdown lists the results on the current page; picking one replaces the list with that page's view (ability pages included).
 
 ### `/wm` : warframe.market
 
@@ -131,20 +133,22 @@ Shared options:
 | `rank` | Integer 0-10, optional | Mod/arcane rank. `0` = unranked. Omit to include all ranks. |
 | `platform` | Choice, default PC | PC, PlayStation (`ps4`), Xbox, Switch |
 
+All `/wm` lookups are paginated or sectioned. Controls work like `/wf`: a dropdown where there are several sections, Prev/Next where there are several pages.
+
 #### `/wm price item [rank] [platform] [my_price]`
-The seller dashboard. Shows market tone, suggested prices (fast / balanced / patient), best instant-sale (buy order) price, competition stats and a price ladder, a by-rank table when ranks are mixed, last-48-hour sales, tips, and the item image. Pass `my_price` (platinum, at least 1) to see where your price would rank and a verdict.
+The seller dashboard, split into dropdown sections: **Overview** (market tone, fast / balanced / patient prices, instant-sale price, your price verdict when `my_price` is given, item image), **Competition** (stats and price ladder), **By mod rank** (when ranks are mixed), **Last 48h sales** and **Tips**. Prev/Next walks through every section in order.
 
 #### `/wm buyers item [rank] [platform]`
-Up to 8 online buyers (highest offer first) and a code block of ready-to-paste `/w` whispers.
+Up to 48 online buyers (highest offer first), 6 per page, each page with its own copy-paste `/w` whispers.
 
 #### `/wm sellers item [rank] [platform]`
-Up to 8 cheapest online sellers (your competition), with whispers.
+Up to 48 cheapest online sellers (your competition), 6 per page, with whispers.
 
 #### `/wm ducats_compare item`
-Compares the item's ducat value with the average platinum price of online orders. The item name is converted to a slug directly (lower-case, spaces to underscores), so use the exact name.
+Ducat value, average online platinum price, ducats per plat and a rule-of-thumb verdict (about 10+ ducats per plat favours ducating). The item name is converted to a slug directly (lower-case, spaces to underscores), so use the exact name.
 
 #### `/wm trends`
-Looks at up to 500 of the most recent orders on the market, groups them by item, and lists items with more than 2 recent orders, sorted by order count, with total quantity and average platinum. Can take a while.
+Looks at up to 500 of the most recent orders, groups them by item, and ranks items with more than 2 recent orders by order count (medals for the top 3), 10 per page, with units and average platinum. Can take a while.
 
 #### `/wm list item price [quantity] [order_type] [rank] [platform] [visible] [pertrade] [mod_charges] [subtype] [amberstars] [cyanstars]` (owner only)
 Posts an order on your warframe.market account.
@@ -164,16 +168,16 @@ Posts an order on your warframe.market account.
 | `amberstars` | Integer | none | Amber stars (sculptures) |
 | `cyanstars` | Integer | none | Cyan stars (sculptures) |
 
-Returns the new order ID, which you need for `update_order` and `unlist`.
+Replies with a card showing the listing (type, price, quantity and any rank/charges/stars) and the new order ID, which you need for `update_order` and `unlist`.
 
 #### `/wm update_order order_id order_type [quantity] [platinum] [platform] [per_item] [visible] [charges] [rank] [ambers] [cyans]` (owner only)
-Edits an existing order. `order_id` and `order_type` (Sell/Buy) are required; every other option is only sent if you provide it. See [Known issues](#known-issues-found-while-documenting) before relying on this command.
+Edits an existing order. `order_id` and `order_type` (Sell/Buy) are required; every other option is only sent if you provide it. The reply shows the order as it now stands, with a pencil mark on the fields you changed.
 
 #### `/wm unlist order_id [platform]` (owner only)
 Removes one of your orders.
 
 #### `/wm my_orders` (owner only)
-Lists all your current orders with item name, order ID, price, quantity, rank and visibility.
+Lists your orders 5 per page with item, side, price, quantity, rank, visibility and order ID. When you have both kinds, a dropdown filters **All / Selling / Buying**.
 
 ---
 
@@ -429,6 +433,11 @@ wiki/
   ability.py               Ability page fetch + parse + pagination
   ability_view.py          Discord View: overview embed, section dropdown, Prev/Next
   embeds.py                WikiPage -> Discord embeds (warframe, weapon, generic, search, error)
+  page_view.py             Overview + section dropdown + pagination for any wiki page
+  search_view.py           /wf search: paginated results + dropdown to open one
+ui/
+  paginator.py             SectionView: shared dropdown + Prev/Next view (wiki and market)
+  text.py                  paginate_lines / chunk helpers (no Discord imports)
 market/
   client.py                warframe.market v2 client: rate limit, cache, item search, orders, history
   analysis.py              Pricing maths, tips, whispers (pure functions)
@@ -650,7 +659,7 @@ uvicorn doesn't read `.env`. Start it with `--env-file .env` or export the varia
 These come from reading the source and are listed so they are easy to fix. They are not documented features.
 
 1. **JWT is written to the log.** `market/seller.py` logs `"Token found: " + token` after a password sign-in, so the token ends up in `log.log`. Remove that value from the log line.
-2. **`/wm update_order` will raise an error.** The cog calls `seller.update_order(..., per_item=per_item, ...)`, but the method's parameter is named `perTrade`. Rename one side to match. The cog only catches `SellerError`, so a `TypeError` is not handled.
+2. ~~`/wm update_order` raised a `TypeError`~~ Fixed: the cog now passes `perTrade=per_item`, and unexpected errors are logged and reported. Note that `per_item` is still a boolean option while `/wm list`'s `pertrade` is an integer; check which one warframe.market's API expects.
 3. **`requirements.txt` is incomplete.** `python-dotenv` (imported by `bot.py` and `market/seller.py`) is missing, and `pytest` is needed to run the tests. The file also starts with the comment "add these to your existing requirements.txt".
 4. **FastAPI file location.** The API source is `main.py` at the repo root, but its docstring and `INTEGRATION.md` say to run `uvicorn api.main:app`, and `api/` only contains `__init__.py`. Either move `main.py` to `api/main.py`, or run `uvicorn main:app`.
 5. **Some `/wm` commands aren't owner-gated but use your account.** `/wm ducats_compare` and `/wm trends` go through the authenticated seller session (signing in with your credentials if needed) and can be run by anyone.

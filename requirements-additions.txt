@@ -1,0 +1,6 @@
+# add these to your existing requirements.txt
+nextcord>=3.0          # IntegrationType / InteractionContextType (user-install commands)
+aiohttp>=3.9
+beautifulsoup4>=4.12
+fastapi>=0.110
+uvicorn[standard]>=0.29

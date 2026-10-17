@@ -37,6 +37,7 @@ parser can handle all of them without page-type-specific scraping code.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urljoin
@@ -236,11 +237,24 @@ def _heading_container(h2: Tag) -> Tag:
     return h2
 
 
-def _extract_article_sections(soup: BeautifulSoup, *, max_sections: int = 12) -> dict[str, str]:
+def _subheading_text(node: Tag) -> str:
+    """Text of an ``===Sub-heading===`` (``<h3>``, possibly wrapped in
+    ``div.mw-heading3``), or "" when ``node`` isn't one."""
+    h3 = node if node.name == "h3" else (
+        node.find("h3") if node.name == "div" and "mw-heading" in (node.get("class") or []) else None)
+    if h3 is None:
+        return ""
+    return " ".join(re.sub(r"\[\s*edit.*?\]", "", _clean_text(h3)).split())
+
+
+def _extract_article_sections(soup: BeautifulSoup, *, max_sections: int = 24,
+                              max_lines: int = 80) -> dict[str, str]:
     """Pull plain-text body content for each ``==Heading==`` in the article
     (e.g. "Acquisition", "Trivia", "Characteristics", "Notes"). Tables,
     images, and nested widgets are skipped in favor of paragraphs and
-    top-level bullet points, which read well inside a Discord embed."""
+    top-level bullet points, which read well inside a Discord embed.
+    ``===Sub-headings===`` are kept as bold lines. Nothing is cut short here
+    apart from a generous ``max_lines``: the Discord views paginate long text."""
     result: dict[str, str] = {}
 
     for h2 in soup.find_all("h2"):
@@ -262,10 +276,14 @@ def _extract_article_sections(soup: BeautifulSoup, *, max_sections: int = 12) ->
                     text = _clean_text(li)
                     if text:
                         lines.append(f"\u2022 {text}")
+            else:
+                sub = _subheading_text(node)
+                if sub:
+                    lines.append(f"**{sub}**")
             node = node.find_next_sibling()
 
         if lines:
-            result[title] = "\n".join(lines[:8])
+            result[title] = "\n".join(lines[:max_lines])
 
     return result
 
@@ -273,9 +291,6 @@ def _extract_article_sections(soup: BeautifulSoup, *, max_sections: int = 12) ->
 def parse_page(title: str, url: str, html: str) -> WikiPage:
     """Parse the rendered HTML (``action=parse`` output) of a wiki page."""
     soup = BeautifulSoup(html, "lxml")
-    fp = open("error.log", "w", encoding="utf-8")
-    fp.write(soup.select("body")[0].get_text(separator="\n"))
-    fp.close()
     # Strip hidden tooltip/search metadata blobs (raw JSON embedded for a JS
     # gadget) that would otherwise leak into extracted paragraph text, since
     # BeautifulSoup has no concept of CSS `display:none`.

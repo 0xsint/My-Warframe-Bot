@@ -19,8 +19,19 @@ from nextcord.ext import commands
 
 from market.analysis import build_report
 from market.client import ItemNotFound, WarframeMarketClient, MarketError, PLATFORMS
-from market.embeds import report_embed, whisper_embed
+from market.embeds import (
+    MARKET_FOOTER,
+    ducats_embed,
+    listed_embed,
+    my_orders_sections,
+    order_pages,
+    removed_embed,
+    report_sections,
+    trend_pages,
+    updated_embed,
+)
 from market.seller import MarketSeller, SellerError
+from ui.paginator import Section, SectionView, view_kwargs
 
 log = logging.getLogger("warframebot.cogs.market")
 
@@ -115,27 +126,34 @@ class MarketCommands(commands.Cog):
             return
         it, orders = got
         history = await self.client.get_history(it.slug)       # None if unavailable
-        report = build_report(it.name, it.slug, orders, rank=rank, history=history)
-        await interaction.followup.send(embed=report_embed(report, it, platform=platform, my_price=my_price))
+        report = build_report(it.name, it.slug, orders, rank=rank, history=history, ladder_size=12)
+        view = SectionView(report_sections(report, it, platform=platform, my_price=my_price),
+                           footer_text="Online/in-game players only \u00B7 " + MARKET_FOOTER, chain=True,
+                           select_placeholder="Jump to a section")
+        view.message = await interaction.followup.send(**view_kwargs(view))
+
+    async def _send_orders(self, interaction, item_q: str, rank, platform: str, side: str) -> None:
+        got = await self._fetch(interaction, item_q, platform)
+        if not got:
+            return
+        it, orders = got
+        view = SectionView([Section("Orders", order_pages(it, orders, side=side, rank=rank))],
+                           footer_text="Whispers use warframe.market's standard format \u00B7 " + MARKET_FOOTER)
+        view.message = await interaction.followup.send(**view_kwargs(view))
+
     @wm.subcommand(name="buyers", description="Online buyers you can sell to right now (with whispers)")
     async def buyers(self, interaction: nextcord.Interaction,
                      item: str = _item_option(), rank: int = _rank_option(),
                      platform: str = _platform_option()):
         await interaction.response.defer()
-        got = await self._fetch(interaction, item, platform)
-        if got:
-            it, orders = got
-            await interaction.followup.send(embed=whisper_embed(it, orders, side="buy", rank=rank))
+        await self._send_orders(interaction, item, rank, platform, "buy")
 
     @wm.subcommand(name="sellers", description="Cheapest online sellers (your competition)")
     async def sellers(self, interaction: nextcord.Interaction,
                       item: str = _item_option(), rank: int = _rank_option(),
                       platform: str = _platform_option()):
         await interaction.response.defer()
-        got = await self._fetch(interaction, item, platform)
-        if got:
-            it, orders = got
-            await interaction.followup.send(embed=whisper_embed(it, orders, side="sell", rank=rank))
+        await self._send_orders(interaction, item, rank, platform, "sell")
 
     # ------------------------------------------------- posting (owner only)
     @wm.subcommand(name="list", description="Post a listing on warframe.market (owner only)")
@@ -183,29 +201,25 @@ class MarketCommands(commands.Cog):
             log.exception("Unexpected error while posting a listing")
             await interaction.followup.send("Unexpected error while posting - check the log.", ephemeral=True) # Inform the user that an unexpected error occurred while posting the listing
             return
-        # Prepare the embed message to display the listed order details
-        embed = nextcord.Embed(
-            title=f"Listed: {order.item_name}",
-            description=(
-                f"**{order.order_type.title()}** x{order.quantity} at **{order.platinum}p** each"
-                + (f" (rank {order.rank})" if order.rank is not None else "")
-                + ("" if order.visible else "\n*Hidden - only you can see it.*")
-            ),
-            color=nextcord.Color.green(), 
-        ) # Create the embed message for the listed order
-        # Set the footer for the embed message with the order ID and instructions for unlisting
-        embed.set_footer(text=f"Order id: {order.id}  (use /wm unlist to remove)")
-        await interaction.followup.send(embed=embed, ephemeral=False)
+        await interaction.followup.send(embed=listed_embed(order), ephemeral=False)
     @wm.subcommand(name="ducats_compare", description="Compare item prices in ducats and platinum")
-    async def ducats_compare(self, interaction: nextcord.Interaction, item: str = _item_option()): 
-        # Implementation for comparing item prices in ducats and platinum goes here
-        i = await self.seller.compare_ducats(item)
-        embed = nextcord.Embed(
-            title="Ducats vs Platinum Comparison",
-            description=f"**{i['name']}**: {i['ducats']} ducats, {int(i['average_platinum'])}p average",
-            color=nextcord.Color.gold(),
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=False)
+    async def ducats_compare(self, interaction: nextcord.Interaction, item: str = _item_option()):
+        await interaction.response.defer()          # this makes several API calls
+        try:
+            data = await self.seller.compare_ducats(item)
+            try:
+                it = await self.client.resolve_item(item)    # only for the picture/link
+            except MarketError:
+                it = None
+        except (SellerError, MarketError) as exc:
+            await interaction.followup.send(f"Couldn't compare that item: {exc}", ephemeral=True)
+            return
+        except Exception:
+            log.exception("Unexpected error in ducats_compare")
+            await interaction.followup.send("Unexpected error - check the log.", ephemeral=True)
+            return
+        await interaction.followup.send(embed=ducats_embed(data, it))
+
     @wm.subcommand(name="trends", description="Analyze recent market trends based on recent orders")
     async def trends(self, interaction: nextcord.Interaction):
         await interaction.response.defer()
@@ -213,20 +227,17 @@ class MarketCommands(commands.Cog):
         try:
             trends = await self.seller.analyze_recent_orders()
             log.info("Analyzed recent orders and generated trends.")
-            embed = nextcord.Embed(
-                title="Recent Market Trends",
-                description="\n".join(
-                    f"**{item_name}**: {stats['total_quantity']} sold at an average of {stats['average_platinum']}p Count: {stats['count']}\r\n"
-                    for item_name, stats in trends.items()
-                ),
-                color=nextcord.Color.gold(),
-            )
-            await interaction.followup.send(embed=embed, ephemeral=False)
         except SellerError as se:
             await interaction.followup.send(f"An error occurred while analyzing trends: {se}", ephemeral=True)
+            return
         except Exception as e:
             await interaction.followup.send(f"An unexpected error occurred: {e}", ephemeral=True)
             log.error(f"An unexpected error occurred: {e}")
+            return
+        view = SectionView([Section("Trends", trend_pages(trends))],
+                           footer_text="Based on the latest orders \u00B7 " + MARKET_FOOTER)
+        view.message = await interaction.followup.send(**view_kwargs(view), ephemeral=False)
+
     @wm.subcommand(name="update_order", description="Update one of your listings by order id (owner only)")
     async def update_order(self, interaction: nextcord.Interaction,
                            order_id: str = nextcord.SlashOption(description="Order id shown when you listed it", required=True),
@@ -250,43 +261,22 @@ class MarketCommands(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            await self.seller.update_order(order_id.strip(), order_type=order_type, quantity=quantity, platinum=platinum, platform=platform, per_item=per_item, visible=visible, charges=charges, rank=rank, ambers=ambers, cyans=cyans) # Attempt to update the order with the specified ID
+            updated = await self.seller.update_order(
+                order_id.strip(), order_type=order_type, quantity=quantity, platinum=platinum,
+                platform=platform, perTrade=per_item, visible=visible, charges=charges,
+                rank=rank, ambers=ambers, cyans=cyans)
         except SellerError as exc:
             await interaction.followup.send(f"Couldn't update that listing: {exc}", ephemeral=True)
             return
-        changes = None
-        for order in await self.seller.get_my_orders():
-            if order.get("order_data", {}).get("id") == order_id.strip():
-                changes = order
-                break
-        embed = nextcord.Embed(title="Order Updated", color=nextcord.Color.gold())
-        embed.add_field(name="Order ID", value=order_id.strip(), inline=False)
-        if changes is None:
-            await interaction.followup.send("Couldn't find the updated order.", ephemeral=True)
+        except Exception:
+            log.exception("Unexpected error while updating a listing")
+            await interaction.followup.send("Unexpected error while updating - check the log.", ephemeral=True)
             return
-        embed.add_field(name="Changes", value="## The following fields have been updated:", inline=False)
-        if changes.get("order_data").get("order_type", None) is not None and changes.get("order_data").get("order_type") != order_type:
-            embed.add_field(name="Order Type", value=f"{changes.get('order_data').get('order_type')}", inline=False)
-        if changes.get("order_data").get("quantity", None) is not None and changes.get("order_data").get("quantity") != quantity:
-            embed.add_field(name="Quantity", value=f"{changes.get('order_data').get('quantity')}", inline=False)
-        if changes.get("order_data").get("platinum", None) is not None and changes.get("order_data").get("platinum") != platinum:
-            embed.add_field(name="Platinum", value=f"{changes.get('order_data').get('platinum')}", inline=False)
-        if changes.get("order_data").get("platform", None) is not None and changes.get("order_data").get("platform") != platform:
-            embed.add_field(name="Platform", value=f"{changes.get('order_data').get('platform')}", inline=False)
-        if changes.get("order_data").get("perTrade", None) is not None and changes.get("order_data").get("perTrade") != per_item:
-            embed.add_field(name="Per Item", value=f"{changes.get('order_data').get('perTrade')}", inline=False)
-        if changes.get("order_data").get("visible", None) is not None and changes.get("order_data").get("visible") != visible:
-            embed.add_field(name="Visible", value=f"{changes.get('order_data').get('visible')}", inline=False)
-        if changes.get("order_data").get("charges", None) is not None and changes.get("order_data").get("charges") != charges:
-            embed.add_field(name="Charges", value=f"{changes.get('order_data').get('charges')}", inline=False)
-        if changes.get("order_data").get("rank", None) is not None and changes.get("order_data").get("rank") != rank:
-            embed.add_field(name="Rank", value=f"{changes.get('order_data').get('rank')}", inline=False)
-        if changes.get("order_data").get("amberStars", None) is not None and changes.get("order_data").get("amberStars") != ambers:
-            embed.add_field(name="Amber Stars", value=f"{changes.get('order_data').get('amberStars')}", inline=False)
-        if changes.get("order_data").get("cyanStars", None) is not None and changes.get("order_data").get("cyanStars", None) != cyans:
-            embed.add_field(name="Cyan Stars", value=f"{changes.get('order_data').get('cyanStars')}", inline=False)
-        
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        # fields the user actually passed (order_type is required, so it isn't a "change")
+        asked = {"quantity": quantity, "platinum": platinum, "perTrade": per_item, "visible": visible,
+                 "charges": charges, "rank": rank, "amberStars": ambers, "cyanStars": cyans}
+        changed = frozenset(k for k, v in asked.items() if v is not None)
+        await interaction.followup.send(embed=updated_embed(updated, changed), ephemeral=True)
     @wm.subcommand(name="unlist", description="Remove one of your listings by order id (owner only)")
     async def unlist_order(self, interaction: nextcord.Interaction,
                            order_id: str = nextcord.SlashOption(description="Order id shown when you listed it"),
@@ -304,7 +294,7 @@ class MarketCommands(commands.Cog):
         except SellerError as exc:
             await interaction.followup.send(f"Couldn't remove that listing: {exc}", ephemeral=True)
             return
-        await interaction.followup.send(f"Removed order `{order_id.strip()}`.", ephemeral=True)
+        await interaction.followup.send(embed=removed_embed(order_id.strip()), ephemeral=True)
     @wm.subcommand(name="my_orders", description="List all of your current orders")
     async def my_orders(self, interaction: nextcord.Interaction):
         if not _is_owner(interaction):
@@ -316,19 +306,14 @@ class MarketCommands(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            order_data = ""
             orders = await self.seller.get_my_orders()
-            embed = nextcord.Embed(title=f"{len(orders)} orders!", color=0xE6B422)
-            embed.description = "# Below are the results of the orders"
-            for result in orders:
-                order = result.get("order_data")
-                embed.description += f"\r\n[{order.get('type')}] {result.get('item')} - Order ID: ``{order.get('id')}`` Platinum: ``{order.get('platinum')}`` Per Trade: ``{order.get('quantity')}`` Rank: ``{order.get('rank')}`` Visible = {order.get('visible')}\r\n\r\n"
-            embed.set_footer(text="Data found by warframe.market")
-            await interaction.followup.send(embed=embed)
-            log.info("Found all data related to orders")
         except SellerError as exc:
             await interaction.followup.send(f"Couldn't find listings: {exc}", ephemeral=True)
             return
+        view = SectionView(my_orders_sections(orders), footer_text="Data found by warframe.market",
+                           select_placeholder="Filter orders")
+        view.message = await interaction.followup.send(**view_kwargs(view))
+        log.info("Found all data related to orders")
     # --------------------------------------------------------- autocomplete
     async def _suggest(self, interaction: nextcord.Interaction, current: str) -> None:
         try:
