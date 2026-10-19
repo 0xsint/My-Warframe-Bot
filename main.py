@@ -23,11 +23,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from market.analysis import assess_price, build_report, top_orders, whisper
 from market.client import ItemNotFound, WarframeMarketClient, MarketError
+from market.riven import LichFilter, asking_price, filter_liches
 
 Platform = Literal["pc", "ps4", "xbox", "switch"]
 Side = Literal["sell", "buy"]
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     timeout = aiohttp.ClientTimeout(total=15)
@@ -53,7 +52,7 @@ def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key")
 
 
-def client() -> MarketClient:
+def client() -> WarframeMarketClient:
     return app.state.market
 
 
@@ -157,3 +156,52 @@ async def whispers(
     return {"item": item.name, "side": side, "count": len(picks),
             "whispers": [{"seller": o.seller, "platinum": o.platinum, "rank": o.rank,
                           "status": o.status, "text": whisper(o, item.name)} for o in picks]}
+
+
+LichKind = Literal["lich", "sister"]
+Element = Literal["heat", "cold", "electricity", "toxin", "impact", "puncture", "slash", "radiation"]
+
+
+def _lich_json(a) -> dict:
+    d = asdict(a)
+    d["online"] = a.is_online
+    d["price"] = asking_price(a)
+    return d
+
+
+@app.get("/v1/auctions/{kind}/weapons", dependencies=[Depends(require_key)],
+         summary="Kuva Lich ('lich') or Sister of Parvos ('sister') weapons")
+async def lich_weapons(kind: LichKind, q: str = Query("", max_length=80),
+                       limit: int = Query(25, ge=1, le=100)):
+    try:
+        items = await client().search_lich_weapons(kind, q, limit)
+    except MarketError as exc:
+        raise _handle(exc)
+    return {"kind": kind, "query": q, "results": [
+        {"slug": i.slug, "name": i.name, "image": i.image_url} for i in items]}
+
+
+@app.get("/v1/auctions/{kind}/{slug}", dependencies=[Depends(require_key)],
+         summary="Kuva Lich / Sister of Parvos auctions for one weapon, cheapest first")
+async def lich_auctions(
+    response: Response, kind: LichKind, slug: str,
+    element: Optional[Element] = None,
+    min_damage: Optional[int] = Query(None, ge=0, le=100, description="Minimum bonus damage %"),
+    ephemera: Optional[bool] = Query(None, description="true = must have an ephemera, false = must not"),
+    max_price: Optional[int] = Query(None, ge=1, description="Highest buyout or bid"),
+    online_only: bool = True,
+    limit: int = Query(50, ge=1, le=200),
+    platform: Platform = "pc",
+    crossplay: bool = True,
+):
+    try:
+        item = await client().resolve_lich_weapon(kind, slug)
+        raw = await client().get_lich_auctions(kind, item.slug, platform=platform, crossplay=crossplay)
+    except MarketError as exc:
+        raise _handle(exc)
+    picked = filter_liches(raw, LichFilter(element=element, min_damage=min_damage, ephemera=ephemera,
+                                           max_price=max_price, online_only=online_only))
+    response.headers["Cache-Control"] = "public, max-age=30"
+    return {"kind": kind, "weapon": item.name, "slug": item.slug, "count": len(picked),
+            "platform": platform, "crossplay": crossplay,
+            "auctions": [_lich_json(a) for a in picked[:limit]]}

@@ -23,6 +23,14 @@ Summary
   WFM_JWT           market/seller    Needed for owner commands (preferred)
   WFM_EMAIL         market/seller    Alternative to WFM_JWT
   WFM_PASSWORD      market/seller    Alternative to WFM_JWT
+  MONGODB_URI       market/store     YES for multi-user /wm link, list, unlist
+  MONGODB_DB        market/store     No (default "warframebot")
+  WFM_ENCRYPT_KEY   market/store     YES with MONGODB_URI. Fernet key that
+                                     encrypts users' email + password. Generate:
+                                     python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+                                     Keep it out of git and off the DB host;
+                                     losing it makes stored logins unreadable.
+  ALLOWED_USERS_FILE market/store    No (default allowed_user_ids.json)
   WFBOT_API_KEY     FastAPI service  No (API is open if unset)
   WFBOT_CORS        FastAPI service  No (defaults to "*")
 
@@ -133,6 +141,11 @@ OWNER_ID="your-discord-user-id"
 WFM_JWT=""
 WFM_EMAIL=""
 WFM_PASSWORD=""
+
+# --- Multi-user selling (MongoDB). Users listed in allowed_user_ids.json run /wm link ---
+MONGODB_URI="mongodb://localhost:27017"
+MONGODB_DB="warframebot"
+WFM_ENCRYPT_KEY=""
 
 # --- FastAPI service (optional) ---
 WFBOT_API_KEY=""

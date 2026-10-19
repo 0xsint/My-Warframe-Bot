@@ -4,8 +4,11 @@
     /wm buyers  item:<..> [rank] [platform]              online buyers + copy-paste whispers
     /wm sellers item:<..> [rank] [platform]              your online competition
     /wm riven   weapon:<..> [stat1..3] [negative] [polarity] ...   riven contracts (auctions) for a weapon
-    /wm list    item:<..> price:<..> [...]               post a listing   (owner only)
-    /wm unlist  order_id:<..>                            remove a listing (owner only)
+    /wm lich    weapon:<..> [element] [min_damage] ...   Kuva Lich auctions
+    /wm sister  weapon:<..> [element] [min_damage] ...   Sister of Parvos auctions
+    /wm link / unlink                                    store / delete your warframe.market login
+    /wm list    item:<..> price:<..> [...]               post a listing   (allow-listed users)
+    /wm unlist  order_id:<..>                            remove a listing (allow-listed users)
 
 Load with:   bot.load_extension("cogs.market_commands")
 """
@@ -28,12 +31,15 @@ from market.embeds import (
     order_pages,
     removed_embed,
     report_sections,
+    lich_pages,
     riven_pages,
     trend_pages,
     updated_embed,
 )
-from market.riven import POLARITIES, RivenFilter, filter_rivens, stat_suggestions, unknown_stats
+from market.riven import (ELEMENTS, POLARITIES, LichFilter, RivenFilter, filter_liches,
+                          filter_rivens, stat_suggestions, unknown_stats)
 from market.seller import MarketSeller, SellerError
+from market.store import AllowList, StoreError, UserStore
 from ui.paginator import Section, SectionView, view_kwargs
 
 log = logging.getLogger("warframebot.cogs.market")
@@ -46,6 +52,7 @@ EVERYWHERE = [
 ]
 PLATFORM_CHOICES = {"PC": "pc", "PlayStation": "ps4", "Xbox": "xbox", "Switch": "switch"}
 ORDER_TYPE_CHOICES = {"Sell": "sell", "Buy": "buy"}
+ELEMENT_CHOICES = {e.title(): e for e in ELEMENTS}
 RIVEN_POLARITY_CHOICES = {p.title(): p for p in POLARITIES}
 
 
@@ -64,13 +71,40 @@ def _platform_option():
 
 
 def _is_owner(interaction: nextcord.Interaction) -> bool:
-    """Only the account owner may post/remove listings. This is a user-installable
-    app, so *anyone* can run its commands; the listing commands act on YOUR
-    warframe.market account and must never be open to everyone.
-    OWNER_ID in .env: your Discord user id (comma-separate for several)."""
+    """Owners (OWNER_ID in .env, comma-separated Discord ids) are always allowed
+    to sell and may use the shared WFM_* account from .env."""
     raw = os.getenv("OWNER_ID", "")
     allowed = {int(x) for x in raw.replace(" ", "").split(",") if x.isdigit()}
     return interaction.user.id in allowed
+
+
+LINK_NOTICE = ("Your email and password are encrypted before they are stored, and only used "
+               "to sign in to warframe.market. Discord shows what you type here to you only.")
+
+
+class LinkModal(nextcord.ui.Modal):
+    """Asks for warframe.market credentials in a private form, so they never
+    appear as slash-command arguments or in the channel."""
+
+    def __init__(self, cog: "MarketCommands") -> None:
+        super().__init__("Link warframe.market account")
+        self.cog = cog
+        self.email = nextcord.ui.TextInput(
+            label="Email (stored encrypted)", placeholder="you@example.com",
+            max_length=254, required=True)
+        self.password = nextcord.ui.TextInput(
+            label="Password (stored encrypted)", placeholder="Encrypted before it is saved",
+            max_length=128, required=True)
+        self.notice = nextcord.ui.TextInput(
+            label="Read me", style=nextcord.TextInputStyle.paragraph, required=False,
+            default_value=LINK_NOTICE + " Leave this box as it is.", max_length=400)
+        self.add_item(self.email)
+        self.add_item(self.password)
+        self.add_item(self.notice)
+
+    async def callback(self, interaction: nextcord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        await self.cog._finish_link(interaction, (self.email.value or "").strip(), self.password.value or "")
 
 
 class MarketCommands(commands.Cog):
@@ -79,6 +113,87 @@ class MarketCommands(commands.Cog):
         self._session: aiohttp.ClientSession | None = None
         self._client: WarframeMarketClient | None = None
         self._seller: MarketSeller | None = None
+        self._store: UserStore | None = None
+        self._user_sellers: dict[int, MarketSeller] = {}
+        self._allow = AllowList()
+
+    @property
+    def store(self) -> UserStore:
+        if self._store is None:
+            self._store = UserStore.from_env()
+        return self._store
+
+    def _may_sell(self, interaction: nextcord.Interaction) -> bool:
+        return _is_owner(interaction) or self._allow.is_allowed(interaction.user.id)
+
+    async def _seller_for(self, interaction: nextcord.Interaction) -> MarketSeller | None:
+        """The caller's own warframe.market session, or None after telling them why not.
+        Call after interaction.response.defer(ephemeral=True)."""
+        uid = interaction.user.id
+        if not self._may_sell(interaction):
+            await interaction.followup.send(
+                "You're not on the list of users allowed to sell. Ask the bot owner to add your Discord id.",
+                ephemeral=True)
+            return None
+        cached = self._user_sellers.get(uid)
+        if cached is not None:
+            return cached
+        try:
+            creds = await self.store.get(uid)
+        except StoreError as exc:
+            log.error("Credential store problem: %s", exc)
+            await interaction.followup.send("Account storage isn't available right now.", ephemeral=True)
+            return None
+        except Exception:
+            log.exception("Could not read credentials from MongoDB")
+            await interaction.followup.send("Account storage isn't available right now.", ephemeral=True)
+            return None
+        if creds is None:
+            if _is_owner(interaction) and self.seller.configured:
+                return self.seller
+            await interaction.followup.send("Link your warframe.market account first with `/wm link`.",
+                                            ephemeral=True)
+            return None
+        seller = MarketSeller(creds.email, creds.password, jwt=creds.jwt,
+                              on_token=lambda token, uid=uid: self.store.save_token(uid, token))
+        self._user_sellers[uid] = seller
+        return seller
+
+    async def _finish_link(self, interaction: nextcord.Interaction, email: str, password: str) -> None:
+        if not self._may_sell(interaction):
+            await interaction.followup.send("You're not on the list of users allowed to sell.", ephemeral=True)
+            return
+        if not email or not password:
+            await interaction.followup.send("Email and password are both required.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        seller = MarketSeller(email, password, on_token=lambda token: self.store.save_token(uid, token))
+        seller.
+        try:
+            token = await seller.login()    # only save credentials that actually work
+            await self.store.save(uid, email, password, jwt=token)
+        except SellerError as exc:
+            await seller.close()
+            await interaction.followup.send(f"Couldn't sign in to warframe.market: {exc}", ephemeral=True)
+            return
+        except StoreError as exc:
+            await seller.close()
+            log.error("Credential store problem: %s", exc)
+            await interaction.followup.send("Account storage isn't available right now.", ephemeral=True)
+            return
+        except Exception:
+            await seller.close()
+            log.exception("Could not link account")
+            await interaction.followup.send("Couldn't save your account - check the log.", ephemeral=True)
+            return
+        old = self._user_sellers.pop(interaction.user.id, None)
+        if old is not None:
+            await old.close()
+        self._user_sellers[interaction.user.id] = seller
+        await interaction.followup.send(
+            "Linked. Your email, password and login cookie are stored encrypted, and the cookie is "
+            "used from now on; your password is only used to sign in again if the cookie stops working. You can now use `/wm list`, `/wm unlist`, "
+            "`/wm update_order` and `/wm my_orders`. Use `/wm unlink` to delete them.", ephemeral=True)
 
     @property
     def client(self) -> WarframeMarketClient:
@@ -98,6 +213,8 @@ class MarketCommands(commands.Cog):
             self.bot.loop.create_task(self._session.close())
         if self._seller is not None:
             self.bot.loop.create_task(self._seller.close())
+        for seller in self._user_sellers.values():
+            self.bot.loop.create_task(seller.close())
 
     # --------------------------------------------------------------- group
     @nextcord.slash_command(name="wm", description="warframe.market tools for sellers",
@@ -217,8 +334,105 @@ class MarketCommands(commands.Cog):
                            footer_text="Cheapest first \u00B7 " + MARKET_FOOTER)
         view.message = await interaction.followup.send(**view_kwargs(view))
 
-    # ------------------------------------------------- posting (owner only)
-    @wm.subcommand(name="list", description="Post a listing on warframe.market (owner only)")
+    # ------------------------------------------------ account link / unlink
+    @wm.subcommand(name="link", description="Link your warframe.market account so you can list and unlist")
+    async def link(self, interaction: nextcord.Interaction):
+        if not self._may_sell(interaction):
+            await interaction.response.send_message(
+                "You're not on the list of users allowed to sell. Ask the bot owner to add your Discord id.",
+                ephemeral=True)
+            return
+        await interaction.response.send_modal(LinkModal(self))
+
+    @wm.subcommand(name="unlink", description="Delete your stored warframe.market credentials")
+    async def unlink(self, interaction: nextcord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        seller = self._user_sellers.pop(interaction.user.id, None)
+        if seller is not None:
+            await seller.close()
+        try:
+            removed = await self.store.delete(interaction.user.id)
+        except Exception:
+            log.exception("Could not delete credentials")
+            await interaction.followup.send("Account storage isn't available right now.", ephemeral=True)
+            return
+        await interaction.followup.send("Your stored credentials were deleted." if removed
+                                        else "You had no linked account.", ephemeral=True)
+
+    # ------------------------------------------ Kuva Lich / Sister auctions
+    async def _lich_auctions(self, interaction: nextcord.Interaction, kind: str, weapon: str,
+                             element, min_damage, ephemera, max_price, online_only, platform):
+        await interaction.response.defer()
+        try:
+            item = await self.client.resolve_lich_weapon(kind, weapon)
+            auctions = await self.client.get_lich_auctions(kind, item.slug, platform=platform)
+        except ItemNotFound:
+            await interaction.followup.send(f"No {'Kuva Lich' if kind == 'lich' else 'Sister of Parvos'} "
+                                            f"weapon matches **{weapon}**.")
+            return
+        except MarketError as exc:
+            await interaction.followup.send(f"warframe.market problem: {exc}")
+            return
+        if not auctions:
+            await interaction.followup.send(f"No auctions listed for **{item.name}** on {platform.upper()}.")
+            return
+        matches = filter_liches(auctions, LichFilter(element=element, min_damage=min_damage,
+                                                     ephemera=ephemera, max_price=max_price,
+                                                     online_only=online_only))
+        view = SectionView([Section("Auctions", lich_pages(kind, item, matches))],
+                           footer_text="Cheapest first \u00B7 " + MARKET_FOOTER)
+        view.message = await interaction.followup.send(**view_kwargs(view))
+
+    @wm.subcommand(name="lich", description="Kuva Lich weapon auctions")
+    async def lich(self, interaction: nextcord.Interaction,
+                   weapon: str = nextcord.SlashOption(description="Kuva weapon, e.g. Kuva Kohm", autocomplete=True),
+                   element: str = nextcord.SlashOption(description="Bonus element", required=False,
+                                                       choices=ELEMENT_CHOICES),
+                   min_damage: int = nextcord.SlashOption(description="Minimum bonus damage %",
+                                                          required=False, min_value=25, max_value=60),
+                   ephemera: bool = nextcord.SlashOption(description="Has an ephemera (omit for any)", required=False),
+                   max_price: int = nextcord.SlashOption(description="Highest buyout or bid to show",
+                                                         required=False, min_value=1),
+                   online_only: bool = nextcord.SlashOption(description="Only sellers who are online (default yes)",
+                                                            required=False, default=True),
+                   platform: str = _platform_option()):
+        await self._lich_auctions(interaction, "lich", weapon, element, min_damage, ephemera,
+                                  max_price, online_only, platform)
+
+    @wm.subcommand(name="sister", description="Sister of Parvos (Tenet/Coda) weapon auctions")
+    async def sister(self, interaction: nextcord.Interaction,
+                     weapon: str = nextcord.SlashOption(description="Tenet/Coda weapon, e.g. Tenet Cycron",
+                                                        autocomplete=True),
+                     element: str = nextcord.SlashOption(description="Bonus element", required=False,
+                                                         choices=ELEMENT_CHOICES),
+                     min_damage: int = nextcord.SlashOption(description="Minimum bonus damage %",
+                                                            required=False, min_value=25, max_value=60),
+                     ephemera: bool = nextcord.SlashOption(description="Has an ephemera (omit for any)", required=False),
+                     max_price: int = nextcord.SlashOption(description="Highest buyout or bid to show",
+                                                           required=False, min_value=1),
+                     online_only: bool = nextcord.SlashOption(description="Only sellers who are online (default yes)",
+                                                              required=False, default=True),
+                     platform: str = _platform_option()):
+        await self._lich_auctions(interaction, "sister", weapon, element, min_damage, ephemera,
+                                  max_price, online_only, platform)
+
+    async def _lich_suggest(self, interaction: nextcord.Interaction, kind: str, current: str):
+        try:
+            weapons = await self.client.search_lich_weapons(kind, current, 25)
+        except Exception:
+            weapons = []
+        await interaction.response.send_autocomplete({w.name[:100]: w.name[:100] for w in weapons})
+
+    @lich.on_autocomplete("weapon")
+    async def _lich_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._lich_suggest(interaction, "lich", current)
+
+    @sister.on_autocomplete("weapon")
+    async def _sister_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._lich_suggest(interaction, "sister", current)
+
+    # ------------------------------------------------- posting 
+    @wm.subcommand(name="list", description="Post a listing on your warframe.market account")
     async def list_order(self, interaction: nextcord.Interaction,
                          item: str = _item_option(),
                          price: int = nextcord.SlashOption(description="Platinum per unit", min_value=1),
@@ -237,18 +451,13 @@ class MarketCommands(commands.Cog):
                          platform: str = _platform_option(),
                          visible: bool = nextcord.SlashOption(description="Show the listing publicly (default yes)",
                                                               required=False, default=True)):
-        if not _is_owner(interaction):
-            await interaction.response.send_message("You're not allowed to post listings.", ephemeral=True)
-            return
-        if not self.seller.configured:
-            await interaction.response.send_message(
-                "Listing isn't set up: add WFM_JWT (or WFM_EMAIL + WFM_PASSWORD) to .env.", ephemeral=True)
-            return
-
         await interaction.response.defer(ephemeral=True)
+        seller = await self._seller_for(interaction)
+        if seller is None:
+            return
         try:
             it = await self.client.resolve_item(item) # Resolve the item to get its slug and other details
-            order = await self.seller.create_order(
+            order = await seller.create_order(
                 it.slug, order_type=order_type, platinum=price, quantity=quantity,
                 rank=rank, visible=visible, platform=platform, perTrade=pertrade, mod_charges=mod_charges, subtype=subtype, amberStars=amberstars, cyanStars=cyanstars
             ) # Create the order on the Warframe Market
@@ -263,7 +472,7 @@ class MarketCommands(commands.Cog):
             log.exception("Unexpected error while posting a listing")
             await interaction.followup.send("Unexpected error while posting - check the log.", ephemeral=True) # Inform the user that an unexpected error occurred while posting the listing
             return
-        await interaction.followup.send(embed=listed_embed(order), ephemeral=False)
+        await interaction.followup.send(embed=listed_embed(order), ephemeral=True)
     @wm.subcommand(name="ducats_compare", description="Compare item prices in ducats and platinum")
     async def ducats_compare(self, interaction: nextcord.Interaction, item: str = _item_option()):
         await interaction.response.defer()          # this makes several API calls
@@ -300,7 +509,7 @@ class MarketCommands(commands.Cog):
                            footer_text="Based on the latest orders \u00B7 " + MARKET_FOOTER)
         view.message = await interaction.followup.send(**view_kwargs(view), ephemeral=False)
 
-    @wm.subcommand(name="update_order", description="Update one of your listings by order id (owner only)")
+    @wm.subcommand(name="update_order", description="Update one of your listings by order id ")
     async def update_order(self, interaction: nextcord.Interaction,
                            order_id: str = nextcord.SlashOption(description="Order id shown when you listed it", required=True),
                            order_type = nextcord.SlashOption(description="New order type (buy/sell)", required=True, choices=ORDER_TYPE_CHOICES),
@@ -314,16 +523,12 @@ class MarketCommands(commands.Cog):
                            ambers: int = nextcord.SlashOption(description="New number of ambers for the order", required=False),
                            cyans: int = nextcord.SlashOption(description="New number of cyans for the order", required=False),
                            ): # Define the parameters for the update_order subcommand
-        if not _is_owner(interaction):
-            await interaction.response.send_message("You're not allowed to update listings.", ephemeral=True)
-            return
-        if not self.seller.configured:
-            await interaction.response.send_message(
-                "Listing isn't set up: add WFM_JWT (or WFM_EMAIL + WFM_PASSWORD) to .env.", ephemeral=True)
-            return
         await interaction.response.defer(ephemeral=True)
+        seller = await self._seller_for(interaction)
+        if seller is None:
+            return
         try:
-            updated = await self.seller.update_order(
+            updated = await seller.update_order(
                 order_id.strip(), order_type=order_type, quantity=quantity, platinum=platinum,
                 platform=platform, perTrade=per_item, visible=visible, charges=charges,
                 rank=rank, ambers=ambers, cyans=cyans)
@@ -339,42 +544,34 @@ class MarketCommands(commands.Cog):
                  "charges": charges, "rank": rank, "amberStars": ambers, "cyanStars": cyans}
         changed = frozenset(k for k, v in asked.items() if v is not None)
         await interaction.followup.send(embed=updated_embed(updated, changed), ephemeral=True)
-    @wm.subcommand(name="unlist", description="Remove one of your listings by order id (owner only)")
+    @wm.subcommand(name="unlist", description="Remove one of your listings by order id ")
     async def unlist_order(self, interaction: nextcord.Interaction,
                            order_id: str = nextcord.SlashOption(description="Order id shown when you listed it"),
                            platform: str = _platform_option()):
-        if not _is_owner(interaction):
-            await interaction.response.send_message("You're not allowed to remove listings.", ephemeral=True)
-            return
-        if not self.seller.configured:
-            await interaction.response.send_message(
-                "Listing isn't set up: add WFM_JWT (or WFM_EMAIL + WFM_PASSWORD) to .env.", ephemeral=True)
-            return
         await interaction.response.defer(ephemeral=True)
+        seller = await self._seller_for(interaction)
+        if seller is None:
+            return
         try:
-            await self.seller.delete_order(order_id.strip(), platform=platform) # Attempt to delete the order with the specified ID
+            await seller.delete_order(order_id.strip(), platform=platform) # Attempt to delete the order with the specified ID
         except SellerError as exc:
             await interaction.followup.send(f"Couldn't remove that listing: {exc}", ephemeral=True)
             return
         await interaction.followup.send(embed=removed_embed(order_id.strip()), ephemeral=True)
     @wm.subcommand(name="my_orders", description="List all of your current orders")
     async def my_orders(self, interaction: nextcord.Interaction):
-        if not _is_owner(interaction):
-            await interaction.response.send_message("You are not allowed to view orders", ephemeral=True)
-            return
-        if not self.seller.configured:
-            await interaction.response.send_message(
-                "Listing isn't set up: add WFM_JWT (or WFM_EMAIL + WFM_PASSWORD) to .env.", ephemeral=True)
-            return
         await interaction.response.defer(ephemeral=True)
+        seller = await self._seller_for(interaction)
+        if seller is None:
+            return
         try:
-            orders = await self.seller.get_my_orders()
+            orders = await seller.get_my_orders()
         except SellerError as exc:
             await interaction.followup.send(f"Couldn't find listings: {exc}", ephemeral=True)
             return
         view = SectionView(my_orders_sections(orders), footer_text="Data found by warframe.market",
                            select_placeholder="Filter orders")
-        view.message = await interaction.followup.send(**view_kwargs(view))
+        view.message = await interaction.followup.send(**view_kwargs(view), ephemeral=True)
         log.info("Found all data related to orders")
     # --------------------------------------------------------- autocomplete
     async def _suggest(self, interaction: nextcord.Interaction, current: str) -> None:
