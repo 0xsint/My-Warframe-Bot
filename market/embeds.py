@@ -7,7 +7,7 @@ from typing import Optional, Sequence
 import nextcord
 
 from .analysis import SellerReport, assess_price, top_orders, whisper
-from .client import Item, Order, RivenAuction
+from .client import Item, LichAuction, Order, RivenAuction
 from .riven import asking_price, stat_label
 
 GOLD = 0xE6B422
@@ -272,6 +272,42 @@ def riven_pages(item: Item, auctions: Sequence[RivenAuction], *, label: str | No
                   for i, a in enumerate(group, start=n * per_page + 1)]
         summary = f"**{len(auctions)}** riven contract{'s' if len(auctions) != 1 else ''} \u00B7 cheapest first"
         pages.append(_embed(title, url=item.url, description=summary + "\n\n" + "\n\n".join(blocks),
+                            thumb=item.image_url))
+    return pages
+
+
+# --------------------------------------------------- /wm lich, /wm sister ---
+LICH_TITLES = {"lich": "Kuva Lich", "sister": "Sister of Parvos"}
+
+
+def _lich_block(i: int, a: LichAuction) -> str:
+    price = asking_price(a)
+    if a.buyout_price:
+        cost = f"Buyout **{a.buyout_price}{PLAT}**"
+    elif price:
+        cost = f"Bid **{price}{PLAT}**"
+    else:
+        cost = "Price **n/a**"
+    parts = [f"{a.element.title() or 'No element'} {a.damage}%"]
+    if a.quirk:
+        parts.append(stat_label(a.quirk))
+    parts.append("Ephemera" if a.ephemera else "No ephemera")
+    return f"`{i:>2}.` **{' \u00B7 '.join(parts)}**\n{cost} \u00B7 {a.seller} \u00B7 {STATUS_ICON.get(a.status, a.status)}"
+
+
+def lich_pages(kind: str, item: Item, auctions: Sequence[LichAuction], *,
+               per_page: int = 5) -> list[nextcord.Embed]:
+    """Kuva Lich / Sister auctions, `per_page` per embed. Input order is kept."""
+    title = f"{item.name}: {LICH_TITLES.get(kind, kind)} auctions"
+    url = f"https://warframe.market/auctions/search?type={kind}&weapon_url_name={item.slug}"
+    if not auctions:
+        return [_embed(title, url=url, description="No auctions match your filters.",
+                       thumb=item.image_url)]
+    pages = []
+    for n, group in enumerate(chunk(list(auctions), per_page)):
+        blocks = [_lich_block(i, a) for i, a in enumerate(group, start=n * per_page + 1)]
+        summary = f"**{len(auctions)}** auction{'s' if len(auctions) != 1 else ''} \u00B7 cheapest first"
+        pages.append(_embed(title, url=url, description=summary + "\n\n" + "\n\n".join(blocks),
                             thumb=item.image_url))
     return pages
 

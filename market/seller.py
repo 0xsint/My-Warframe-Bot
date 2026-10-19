@@ -89,10 +89,20 @@ class ListedOrder:
 
 
 class MarketSeller:
-    def __init__(self) -> None:
+    def __init__(self, email: str | None = None, password: str | None = None, *,
+                 jwt: str | None = None, on_token=None) -> None:
+        """No arguments: the shared account from .env (WFM_JWT or WFM_EMAIL + WFM_PASSWORD).
+        With email/password and/or a saved jwt: that user's own account; .env is never consulted.
+        The saved jwt is used first; email and password are only used to sign in again when it
+        is rejected. `on_token` is an async callable that receives every freshly issued jwt."""
+        self._own = bool(email or password or jwt)
+        self._email = email if self._own else os.getenv("WFM_EMAIL") 
+        self._password = password if self._own else os.getenv("WFM_PASSWORD")
+        self._on_token = on_token
         self._session: aiohttp.ClientSession | None = None
-        self._jwt: str | None = os.getenv("WFM_JWT") or None
-        self._static_token = self._jwt is not None # can't re-login if it expires
+        self._jwt: str | None = jwt if self._own else (os.getenv("WFM_JWT") or None)
+        # a token with no email/password behind it can't be renewed
+        self._static_token = self._jwt is not None and not (self._email and self._password)
         self._csrf: str | None = None
         self._lock = asyncio.Lock()
         self._last = 0.0
@@ -101,13 +111,17 @@ class MarketSeller:
     # ------------------------------------------------------------ plumbing
     @property
     def configured(self) -> bool:
-        return bool(self._jwt or (os.getenv("WFM_EMAIL") and os.getenv("WFM_PASSWORD")))
+        return bool(self._jwt or (self._email and self._password))
 
     def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             jar = aiohttp.CookieJar()
             self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), cookie_jar=jar)
         return self._session
+
+    @property
+    def jwt(self) -> str | None:
+        return self._jwt
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -259,7 +273,7 @@ class MarketSeller:
                 finally:
                       ws_log.info("Websocket Closed")
     async def login(self) -> None:
-        email, password = os.getenv("WFM_EMAIL"), os.getenv("WFM_PASSWORD")
+        email, password = self._email, self._password
         if not (email and password):
             raise SellerError("Set WFM_JWT, or WFM_EMAIL and WFM_PASSWORD, in .env")
         if self._csrf is None:
@@ -282,9 +296,13 @@ class MarketSeller:
             token = self._cookie("JWT") or ""
         if not token:
             raise SellerError("sign-in succeeded but no JWT was returned")
-        log.info("Token found: "+token)
-        
         log.info("Signed in to warframe.market")
+        self._jwt = token
+        if self._on_token is not None:
+            try:
+                await self._on_token(token)
+            except Exception:
+                log.exception("Could not save the new warframe.market token")
         bg_task = asyncio.create_task(self.ws_connect(token))
         
         return token
@@ -322,7 +340,7 @@ class MarketSeller:
             if status == 401 and not self._static_token and not relogged:
                 relogged = True
                 self._jwt = None
-                await self.login()
+                self._jwt = await self.login()
                 continue
             raise SellerError(f"{status}: {self._short(data)}")
     # Fetch the item name based on the item ID
