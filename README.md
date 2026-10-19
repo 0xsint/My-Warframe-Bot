@@ -95,11 +95,13 @@ Two slash command groups are registered globally, usable in servers, DMs and gro
 | `/wm` | `sellers` | Anyone | Cheapest online sellers |
 | `/wm` | `ducats_compare` | Anyone | Ducats vs platinum |
 | `/wm` | `riven` | Anyone | Riven contracts (auctions) for a weapon |
+| `/wm` | `lich` / `sister` | Anyone | Kuva Lich / Sister of Parvos auctions |
+| `/wm` | `link` / `unlink` | **Allow-listed** | Store / delete your warframe.market login |
 | `/wm` | `trends` | Anyone | Recent market trends |
-| `/wm` | `list` | **Owner only** | Post a listing |
-| `/wm` | `update_order` | **Owner only** | Edit a listing |
-| `/wm` | `unlist` | **Owner only** | Remove a listing |
-| `/wm` | `my_orders` | **Owner only** | List your orders |
+| `/wm` | `list` | **Allow-listed** | Post a listing |
+| `/wm` | `update_order` | **Allow-listed** | Edit a listing |
+| `/wm` | `unlist` | **Allow-listed** | Remove a listing |
+| `/wm` | `my_orders` | **Allow-listed** | List your orders |
 
 "Owner" means a Discord user ID listed in `OWNER_ID`.
 
@@ -687,3 +689,14 @@ These come from reading the source and are listed so they are easy to fix. They 
 - Game data comes from the [WARFRAME Wiki](https://wiki.warframe.com) and market data from [warframe.market](https://warframe.market). Check their terms before redistributing content.
 - Built with [nextcord](https://docs.nextcord.dev/), [aiohttp](https://docs.aiohttp.org/), [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/) and [FastAPI](https://fastapi.tiangolo.com/).
 - This project has no license file yet. Add one (for example MIT) to make clear how others may use the code.
+
+
+## Multi-user selling (MongoDB)
+
+Listing commands (`list`, `update_order`, `unlist`, `my_orders`) act on the caller's **own** warframe.market account.
+
+1. Set `MONGODB_URI` and `WFM_ENCRYPT_KEY` in `.env` (see `ENVIRONMENT_VARIABLES.txt`).
+2. Add Discord ids to `allowed_user_ids.json` (`{"allowed_user_ids": [123, 456]}`). It is re-read when the file changes, and a missing or invalid file allows nobody. Ids in `OWNER_ID` are always allowed.
+3. An allowed user runs `/wm link`, fills the private form, and the bot signs in once to check the login. Email and password are stored in the `users` collection, keyed by Discord id. `/wm unlink` deletes them.
+
+Every stored secret is kept as an argon2id hash (checked with `UserStore.verify`) and as a Fernet-encrypted copy. The encrypted copy is needed because signing in to warframe.market takes the real email and password, which a hash cannot return. Anyone with both the database and `WFM_ENCRYPT_KEY` can read the encrypted copies.

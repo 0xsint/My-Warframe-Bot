@@ -221,6 +221,54 @@ def _parse_riven_auction(raw: dict[str, Any]) -> Optional[RivenAuction]:
     )
 
 
+LICH_KINDS = ("lich", "sister")     # Kuva Lich / Sister of Parvos auction types
+
+
+@dataclass
+class LichAuction:
+    """One Kuva Lich or Sister of Parvos auction from warframe.market."""
+    id: str
+    kind: str                       # "lich" | "sister"
+    weapon: str                     # weapon slug, e.g. "kuva_kohm"
+    element: str                    # e.g. "toxin"
+    damage: int                     # bonus damage percent
+    ephemera: bool
+    quirk: str                      # lich only; "" when none
+    buyout_price: Optional[int]
+    starting_price: Optional[int]
+    top_bid: Optional[int]
+    seller: str
+    status: str
+    platform: str = ""
+
+    @property
+    def is_online(self) -> bool:
+        return self.status in ONLINE_STATUSES
+
+
+def _parse_lich_auction(raw: dict[str, Any], kind: str) -> Optional[LichAuction]:
+    item = raw.get("item") or {}
+    if item.get("type") != kind or raw.get("visible") is False or raw.get("closed"):
+        return None
+    owner = raw.get("owner") or {}
+    quirk = str(item.get("quirk") or "")
+    return LichAuction(
+        id=str(raw.get("id", "")),
+        kind=kind,
+        weapon=str(item.get("weapon_url_name") or ""),
+        element=str(item.get("element") or ""),
+        damage=int(item.get("damage") or 0),
+        ephemera=bool(item.get("having_ephemera")),
+        quirk="" if quirk == "none" else quirk,
+        buyout_price=_opt_int(raw.get("buyout_price")),
+        starting_price=_opt_int(raw.get("starting_price")),
+        top_bid=_opt_int(raw.get("top_bid")),
+        seller=str(owner.get("ingame_name") or "unknown"),
+        status=str(owner.get("status") or "offline"),
+        platform=str(raw.get("platform") or ""),
+    )
+
+
 class WarframeMarketClient:
     """Create once, share everywhere. Pass an aiohttp.ClientSession you manage."""
 
@@ -244,6 +292,8 @@ class WarframeMarketClient:
         self._riven_attrs: list[str] = []
         self._riven_attrs_loaded = 0.0
         self._riven_attrs_lock = asyncio.Lock()
+        self._lich_weapons: dict[str, tuple[float, list[Item]]] = {}
+        self._lich_weapons_lock = asyncio.Lock()
 
     # ------------------------------------------------------------- transport
     async def _get(self, url: str, *, params: dict | None = None, platform: str | None = None,
@@ -352,6 +402,29 @@ class WarframeMarketClient:
                 self._riven_attrs, self._riven_attrs_loaded = slugs, time.monotonic()
             return self._riven_attrs
 
+    async def _load_lich_weapons(self, kind: str) -> list[Item]:
+        async with self._lich_weapons_lock:
+            hit = self._lich_weapons.get(kind)
+            if hit and time.monotonic() - hit[0] < 6 * 3600:
+                return hit[1]
+            data = await self._get(f"{API_V2}/{kind}/weapons", ttl=0)
+            weapons = [w for w in (_parse_item(r) for r in data.get("data", [])) if w]
+            if weapons:
+                self._lich_weapons[kind] = (time.monotonic(), weapons)
+            return weapons or (hit[1] if hit else [])
+
+    async def search_lich_weapons(self, kind: str, query: str, limit: int = 10) -> list[Item]:
+        """Kuva Lich ('lich') or Sister of Parvos ('sister') weapons."""
+        if kind not in LICH_KINDS:
+            raise ValueError(f"kind must be one of {LICH_KINDS}")
+        return _rank_items(await self._load_lich_weapons(kind), query, limit)
+
+    async def resolve_lich_weapon(self, kind: str, query: str) -> Item:
+        found = await self.search_lich_weapons(kind, query, 1)
+        if not found:
+            raise ItemNotFound(f"No {kind} weapon matches '{query}'", 404)
+        return found[0]
+
     # ---------------------------------------------------------------- orders
     async def get_orders(self, slug: str, *, platform: str | None = None,
                          crossplay: bool | None = None) -> list[Order]:
@@ -394,3 +467,18 @@ class WarframeMarketClient:
             return []
         raw = (data.get("payload") or {}).get("auctions") or []
         return [a for a in (_parse_riven_auction(r) for r in raw) if a]
+
+    # ------------------------------------------------ lich / sister auctions
+    async def get_lich_auctions(self, kind: str, weapon_slug: str, *, platform: str | None = None,
+                                crossplay: bool | None = None) -> list[LichAuction]:
+        """Kuva Lich / Sister of Parvos auctions for one weapon (v1 auction search).
+        Hidden and closed auctions are dropped."""
+        if kind not in LICH_KINDS:
+            raise ValueError(f"kind must be one of {LICH_KINDS}")
+        data = await self._get(f"{API_V1}/auctions/search",
+                               params={"type": kind, "weapon_url_name": weapon_slug},
+                               platform=platform, crossplay=crossplay)
+        if not isinstance(data, dict):
+            return []
+        raw = (data.get("payload") or {}).get("auctions") or []
+        return [a for a in (_parse_lich_auction(r, kind) for r in raw) if a]
