@@ -94,6 +94,7 @@ Two slash command groups are registered globally, usable in servers, DMs and gro
 | `/wm` | `buyers` | Anyone | Online buyers + whispers |
 | `/wm` | `sellers` | Anyone | Cheapest online sellers |
 | `/wm` | `ducats_compare` | Anyone | Ducats vs platinum |
+| `/wm` | `riven` | Anyone | Riven contracts (auctions) for a weapon |
 | `/wm` | `trends` | Anyone | Recent market trends |
 | `/wm` | `list` | **Owner only** | Post a listing |
 | `/wm` | `update_order` | **Owner only** | Edit a listing |
@@ -143,6 +144,18 @@ Up to 48 online buyers (highest offer first), 6 per page, each page with its own
 
 #### `/wm sellers item [rank] [platform]`
 Up to 48 cheapest online sellers (your competition), 6 per page, with whispers.
+
+#### `/wm riven weapon [stat1] [stat2] [stat3] [negative] [polarity] [rank] [max_price] [online_only] [platform]`
+Riven mod contracts (auctions) for one weapon, cheapest first, 4 per page. Read-only.
+
+- `weapon`: autocompletes from the riven-eligible weapon list, so Kuva Lich weapons (Kuva Bramma, ...) and Sister of Parvos weapons (Coda Bassocyst, ...) are included.
+- `stat1`-`stat3`: positive stats the riven must have. Each has stat autocomplete. Words are matched against the stat name by prefix, so `crit damage` finds Critical Damage and `multi` finds Multishot. A stat no listed riven has gets a "no riven matches" reply, so typos are caught.
+- `negative`: only rivens whose negative stat (the curse, shown as **(negative)** in the list) is this stat, e.g. `recoil`. Also autocompletes.
+- `polarity`: Madurai, Vazarin or Naramon. `rank`: 0-8 (omit for all).
+- `max_price`: highest buyout (or current bid if there is no buyout) to show.
+- `online_only`: default on, keeps sellers who are in game or online.
+
+Prices are the asking price. Auctions without a buyout show the top bid. Hidden and closed auctions are not shown.
 
 #### `/wm ducats_compare item`
 Ducat value, average online platinum price, ducats per plat and a rule-of-thumb verdict (about 10+ ducats per plat favours ducating). The item name is converted to a slug directly (lower-case, spaces to underscores), so use the exact name.

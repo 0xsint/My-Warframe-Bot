@@ -118,6 +118,109 @@ def _norm(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
+def _rank_items(items: list[Item], query: str, limit: int) -> list[Item]:
+    """Name search: exact > prefix > substring > all words > typo tolerance."""
+    q = _norm(query)
+    if not q:
+        return items[:limit]
+    scored: list[tuple[float, Item]] = []
+    for it in items:
+        n = _norm(it.name)
+        if n == q or _norm(it.slug) == q:
+            score = 100
+        elif n.startswith(q):
+            score = 80 - min(len(n) - len(q), 40) / 2
+        elif q in n:
+            score = 60 - min(n.index(q), 30) / 2
+        elif all(tok in n for tok in q.split()):
+            score = 50
+        else:
+            continue
+        scored.append((score, it))
+    scored.sort(key=lambda s: (-s[0], len(s[1].name)))
+    results = [it for _, it in scored[:limit]]
+    if not results:                              # typo tolerance
+        names = {_norm(it.name): it for it in items}
+        for m in difflib.get_close_matches(q, list(names), n=limit, cutoff=0.6):
+            results.append(names[m])
+    return results
+
+
+# In-game family names -> the prefix the API uses for those weapons.
+_RIVEN_ALIASES = (
+    ("sister of parvos", "coda"), ("sister", "coda"), ("parvos", "coda"),
+    ("kuva lich", "kuva"), ("lich", "kuva"),
+)
+
+
+def _expand_riven_query(query: str) -> str:
+    q = _norm(query)
+    for alias, repl in _RIVEN_ALIASES:
+        q = re.sub(rf"\b{alias}\b", repl, q)
+    return q
+
+
+@dataclass(frozen=True)
+class RivenAttribute:
+    url_name: str                   # e.g. "critical_damage", "base_damage_/_melee_damage"
+    value: float                    # percent, already signed (negative = bad stat)
+    positive: bool                  # True when the stat is a buff on this riven
+
+
+@dataclass
+class RivenAuction:
+    """One riven 'contract' (auction) from warframe.market."""
+    id: str
+    weapon: str                     # weapon slug, e.g. "acceltra"
+    name: str                       # riven name, e.g. "sati-acritox"
+    mod_rank: int                   # 0-8
+    re_rolls: int
+    polarity: str                   # "madurai" | "vazarin" | "naramon" | ""
+    mastery_level: Optional[int]
+    attributes: tuple[RivenAttribute, ...]
+    buyout_price: Optional[int]     # set when the seller offers a direct buy
+    starting_price: Optional[int]   # minimum bid for bid-only auctions
+    top_bid: Optional[int]
+    seller: str
+    status: str                     # "ingame" | "online" | "offline"
+    platform: str = ""
+
+    @property
+    def is_online(self) -> bool:
+        return self.status in ONLINE_STATUSES
+
+
+def _opt_int(value: Any) -> Optional[int]:
+    return None if value is None else int(value)
+
+
+def _parse_riven_auction(raw: dict[str, Any]) -> Optional[RivenAuction]:
+    item = raw.get("item") or {}
+    if item.get("type") != "riven" or raw.get("visible") is False or raw.get("closed"):
+        return None
+    owner = raw.get("owner") or {}
+    attrs = tuple(
+        RivenAttribute(url_name=str(a["url_name"]), value=float(a.get("value") or 0),
+                       positive=bool(a.get("positive")))
+        for a in item.get("attributes") or [] if a.get("url_name"))
+    return RivenAuction(
+        id=str(raw.get("id", "")),
+        weapon=str(item.get("weapon_url_name") or ""),
+        name=str(item.get("name") or ""),
+        mod_rank=int(item.get("mod_rank") or 0),
+        re_rolls=int(item.get("re_rolls") or 0),
+        polarity=str(item.get("polarity") or "").lower(),
+        mastery_level=_opt_int(item.get("mastery_level")),
+        attributes=attrs,
+        buyout_price=_opt_int(raw.get("buyout_price")),
+        starting_price=_opt_int(raw.get("starting_price")),
+        top_bid=_opt_int(raw.get("top_bid")),
+        seller=str(owner.get("ingame_name") or "unknown"),
+        status=str(owner.get("status") or "offline"),
+        platform=str(raw.get("platform") or ""),
+    )
+
+
 class WarframeMarketClient:
     """Create once, share everywhere. Pass an aiohttp.ClientSession you manage."""
 
@@ -135,6 +238,12 @@ class WarframeMarketClient:
         self._items: list[Item] = []
         self._items_loaded = 0.0
         self._items_lock = asyncio.Lock()
+        self._riven_weapons: list[Item] = []
+        self._riven_weapons_loaded = 0.0
+        self._riven_weapons_lock = asyncio.Lock()
+        self._riven_attrs: list[str] = []
+        self._riven_attrs_loaded = 0.0
+        self._riven_attrs_lock = asyncio.Lock()
 
     # ------------------------------------------------------------- transport
     async def _get(self, url: str, *, params: dict | None = None, platform: str | None = None,
@@ -192,37 +301,56 @@ class WarframeMarketClient:
             return self._items
 
     async def search_items(self, query: str, limit: int = 10) -> list[Item]:
-        items = await self._load_items()
-        q = _norm(query)
-        if not q:
-            return items[:limit]
-        scored: list[tuple[float, Item]] = []
-        for it in items:
-            n = _norm(it.name)
-            if n == q or _norm(it.slug) == q:
-                score = 100
-            elif n.startswith(q):
-                score = 80 - min(len(n) - len(q), 40) / 2
-            elif q in n:
-                score = 60 - min(n.index(q), 30) / 2
-            elif all(tok in n for tok in q.split()):
-                score = 50
-            else:
-                continue
-            scored.append((score, it))
-        scored.sort(key=lambda s: (-s[0], len(s[1].name)))
-        results = [it for _, it in scored[:limit]]
-        if not results:                              # typo tolerance
-            names = {_norm(it.name): it for it in items}
-            for m in difflib.get_close_matches(q, list(names), n=limit, cutoff=0.6):
-                results.append(names[m])
-        return results
+        return _rank_items(await self._load_items(), query, limit)
 
     async def resolve_item(self, query_or_slug: str) -> Item:
         found = await self.search_items(query_or_slug, 1)
         if not found:
             raise ItemNotFound(f"No tradable item matches '{query_or_slug}'", 404)
         return found[0]
+
+    async def _load_riven_weapons(self) -> list[Item]:
+        async with self._riven_weapons_lock:
+            if self._riven_weapons and time.monotonic() - self._riven_weapons_loaded < 6 * 3600:
+                return self._riven_weapons
+            data = await self._get(f"{API_V2}/riven/weapons", ttl=0)
+            weapons = [w for w in (_parse_item(r) for r in data.get("data", [])) if w]
+            if weapons:
+                self._riven_weapons, self._riven_weapons_loaded = weapons, time.monotonic()
+            return self._riven_weapons
+
+    async def search_riven_weapons(self, query: str, limit: int = 10) -> list[Item]:
+        """Riven-eligible weapons. Unlike the general item list, this includes
+        Kuva Lich and Sister/Coda weapons."""
+        return _rank_items(await self._load_riven_weapons(), _expand_riven_query(query), limit)
+
+    async def resolve_riven_weapon(self, query: str) -> Item:
+        found = await self.search_riven_weapons(query, 1)
+        if not found:
+            raise ItemNotFound(f"No riven weapon matches '{query}'", 404)
+        return found[0]
+
+    async def resolve_riven_weapons(self, query: str) -> list[Item]:
+        """The weapon a full name points to, or every weapon in a family name ('kuva lich')."""
+        found = await self.search_riven_weapons(query, 8)
+        if not found:
+            raise ItemNotFound(f"No riven weapon matches '{query}'", 404)
+        q = _expand_riven_query(query)
+        exact = [it for it in found if q in (_norm(it.name), _norm(it.slug))]
+        if exact:
+            return exact[:1]
+        return found
+
+    async def get_riven_attributes(self) -> list[str]:
+        """url_name slugs of every riven stat (e.g. 'critical_damage'), cached 6h."""
+        async with self._riven_attrs_lock:
+            if self._riven_attrs and time.monotonic() - self._riven_attrs_loaded < 6 * 3600:
+                return self._riven_attrs
+            data = await self._get(f"{API_V2}/riven/attributes", ttl=0)
+            slugs = [str(r["slug"]) for r in data.get("data", []) if r.get("slug")]
+            if slugs:
+                self._riven_attrs, self._riven_attrs_loaded = slugs, time.monotonic()
+            return self._riven_attrs
 
     # ---------------------------------------------------------------- orders
     async def get_orders(self, slug: str, *, platform: str | None = None,
@@ -253,3 +381,16 @@ class WarframeMarketClient:
             "avg_price_48h": round(weighted / volume, 1),
             "median_48h": medians[len(medians) // 2] if medians else None,
         }
+
+    # -------------------------------------------------------- riven contracts
+    async def get_riven_auctions(self, weapon_slug: str, *, platform: str | None = None,
+                                 crossplay: bool | None = None) -> list[RivenAuction]:
+        """Riven auctions ('contracts') for one weapon, from the v1 auction search.
+        Hidden and closed auctions and non-riven entries are dropped."""
+        data = await self._get(f"{API_V1}/auctions/search",
+                               params={"type": "riven", "weapon_url_name": weapon_slug},
+                               platform=platform, crossplay=crossplay)
+        if not isinstance(data, dict):
+            return []
+        raw = (data.get("payload") or {}).get("auctions") or []
+        return [a for a in (_parse_riven_auction(r) for r in raw) if a]

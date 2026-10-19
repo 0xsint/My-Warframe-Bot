@@ -3,6 +3,7 @@
     /wm price   item:<..> [rank] [platform] [my_price]   pricing dashboard
     /wm buyers  item:<..> [rank] [platform]              online buyers + copy-paste whispers
     /wm sellers item:<..> [rank] [platform]              your online competition
+    /wm riven   weapon:<..> [stat1..3] [negative] [polarity] ...   riven contracts (auctions) for a weapon
     /wm list    item:<..> price:<..> [...]               post a listing   (owner only)
     /wm unlist  order_id:<..>                            remove a listing (owner only)
 
@@ -27,9 +28,11 @@ from market.embeds import (
     order_pages,
     removed_embed,
     report_sections,
+    riven_pages,
     trend_pages,
     updated_embed,
 )
+from market.riven import POLARITIES, RivenFilter, filter_rivens, stat_suggestions, unknown_stats
 from market.seller import MarketSeller, SellerError
 from ui.paginator import Section, SectionView, view_kwargs
 
@@ -43,6 +46,7 @@ EVERYWHERE = [
 ]
 PLATFORM_CHOICES = {"PC": "pc", "PlayStation": "ps4", "Xbox": "xbox", "Switch": "switch"}
 ORDER_TYPE_CHOICES = {"Sell": "sell", "Buy": "buy"}
+RIVEN_POLARITY_CHOICES = {p.title(): p for p in POLARITIES}
 
 
 def _item_option():
@@ -154,6 +158,64 @@ class MarketCommands(commands.Cog):
                       platform: str = _platform_option()):
         await interaction.response.defer()
         await self._send_orders(interaction, item, rank, platform, "sell")
+
+    # ------------------------------------------------------- riven contracts
+    @wm.subcommand(name="riven", description="Riven mod contracts for a weapon, filtered by stats")
+    async def riven(self, interaction: nextcord.Interaction,
+                    weapon: str = nextcord.SlashOption(description="Weapon name, e.g. Acceltra",
+                                                       autocomplete=True),
+                    stat1: str = nextcord.SlashOption(description="Wanted positive stat, e.g. critical damage",
+                                                      required=False, autocomplete=True),
+                    stat2: str = nextcord.SlashOption(description="Second wanted positive stat",
+                                                      required=False, autocomplete=True),
+                    stat3: str = nextcord.SlashOption(description="Third wanted positive stat",
+                                                      required=False, autocomplete=True),
+                    negative: str = nextcord.SlashOption(description="Only rivens whose negative stat is this",
+                                                         required=False, autocomplete=True),
+                    polarity: str = nextcord.SlashOption(description="Riven polarity", required=False,
+                                                         choices=RIVEN_POLARITY_CHOICES),
+                    rank: int = nextcord.SlashOption(description="Mod rank 0-8 (omit for all)",
+                                                     required=False, min_value=0, max_value=8),
+                    max_price: int = nextcord.SlashOption(description="Highest buyout or bid to show",
+                                                          required=False, min_value=1),
+                    online_only: bool = nextcord.SlashOption(description="Only sellers who are online (default yes)",
+                                                             required=False, default=True),
+                    platform: str = _platform_option()):
+        await interaction.response.defer()
+        try:
+            weapons = await self.client.resolve_riven_weapons(weapon)
+            auctions = []
+            for it in weapons:
+                auctions += await self.client.get_riven_auctions(it.slug, platform=platform)
+        except ItemNotFound:
+            await interaction.followup.send(f"No riven weapon matches **{weapon}**.")
+            return
+        except MarketError as exc:
+            await interaction.followup.send(f"warframe.market problem: {exc}")
+            return
+
+        family = len(weapons) > 1
+        label = f"{weapon.strip().title()} weapons" if family else weapons[0].name
+        wanted = tuple(s.strip() for s in (stat1, stat2, stat3) if s and s.strip())
+        neg = (negative or "").strip() or None
+        bad = unknown_stats(auctions, [*wanted, *([neg] if neg else [])])
+        if bad:
+            await interaction.followup.send(
+                f"No riven for **{label}** has a stat matching: {', '.join(bad)}. "
+                "Try a shorter word, e.g. `crit`, `multishot`, `toxin`.")
+            return
+
+        if not auctions:
+            await interaction.followup.send(f"No riven contracts listed for **{label}** on {platform.upper()}.")
+            return
+        matches = filter_rivens(auctions, RivenFilter(polarity=polarity, rank=rank, positives=wanted,
+                                                      negative=neg, max_price=max_price,
+                                                      online_only=online_only))
+        names = {it.slug: it.name for it in weapons} if family else None
+        pages = riven_pages(weapons[0], matches, label=label, weapon_names=names)
+        view = SectionView([Section("Rivens", pages)],
+                           footer_text="Cheapest first \u00B7 " + MARKET_FOOTER)
+        view.message = await interaction.followup.send(**view_kwargs(view))
 
     # ------------------------------------------------- posting (owner only)
     @wm.subcommand(name="list", description="Post a listing on warframe.market (owner only)")
@@ -341,5 +403,38 @@ class MarketCommands(commands.Cog):
     @ducats_compare.on_autocomplete("item")
     async def _ducats_compare_ac(self, interaction: nextcord.Interaction, current: str):
         await self._suggest(interaction, current)
+
+    @riven.on_autocomplete("weapon")
+    async def _riven_ac(self, interaction: nextcord.Interaction, current: str):
+        try:
+            weapons = await self.client.search_riven_weapons(current, 25)
+        except Exception:
+            weapons = []
+        await interaction.response.send_autocomplete({w.name[:100]: w.name[:100] for w in weapons})
+
+    async def _stat_suggest(self, interaction: nextcord.Interaction, current: str) -> None:
+        try:
+            slugs = await self.client.get_riven_attributes()
+        except Exception:
+            slugs = []
+        names = stat_suggestions(current, slugs, 25)
+        await interaction.response.send_autocomplete({n[:100]: n[:100] for n in names})
+
+    @riven.on_autocomplete("stat1")
+    async def _riven_stat1_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._stat_suggest(interaction, current)
+
+    @riven.on_autocomplete("stat2")
+    async def _riven_stat2_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._stat_suggest(interaction, current)
+
+    @riven.on_autocomplete("stat3")
+    async def _riven_stat3_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._stat_suggest(interaction, current)
+
+    @riven.on_autocomplete("negative")
+    async def _riven_negative_ac(self, interaction: nextcord.Interaction, current: str):
+        await self._stat_suggest(interaction, current)
+
 def setup(bot: commands.Bot) -> None:
     bot.add_cog(MarketCommands(bot))

@@ -7,7 +7,8 @@ from typing import Optional, Sequence
 import nextcord
 
 from .analysis import SellerReport, assess_price, top_orders, whisper
-from .client import Item, Order
+from .client import Item, Order, RivenAuction
+from .riven import asking_price, stat_label
 
 GOLD = 0xE6B422
 PLAT = "p"   # platinum suffix; swap for a custom emoji if your bot has one
@@ -234,6 +235,44 @@ def order_pages(item: Item, orders: Sequence[Order], *, side: str, rank: Optiona
         whispers = "\n".join(whisper(o, item.name) for o in group)
         desc = f"{summary}\n\n" + "\n".join(lines) + f"\n\n**Copy-paste whispers**\n```\n{whispers}\n```"
         pages.append(_embed(title, url=item.url, description=desc, thumb=item.image_url))
+    return pages
+
+
+# ------------------------------------------------------------- /wm riven ---
+def _riven_block(i: int, a: RivenAuction, weapon_name: str | None = None) -> str:
+    good, bad = "\u2705", "\u274C"
+    stats = "\n".join(
+        f"{good} {stat_label(s.url_name)} {s.value:+.1f}%" if s.positive
+        else f"{bad} {stat_label(s.url_name)} {s.value:+.1f}% **(negative)**"
+        for s in a.attributes)
+    price = asking_price(a)
+    if a.buyout_price:
+        cost = f"Buyout **{a.buyout_price}{PLAT}**"
+    elif price:
+        cost = f"Bid **{price}{PLAT}**"
+    else:
+        cost = "Price **n/a**"
+    pol = a.polarity.title() if a.polarity else "Unknown polarity"
+    name = a.name or "Riven"
+    weapon = f" \u00B7 {weapon_name}" if weapon_name else ""
+    head = f"`{i:>2}.` **{name}**{weapon} \u00B7 R{a.mod_rank} \u00B7 {pol} \u00B7 {a.re_rolls} rerolls"
+    return f"{head}\n{stats}\n{cost} \u00B7 {a.seller} \u00B7 {STATUS_ICON.get(a.status, a.status)}"
+
+
+def riven_pages(item: Item, auctions: Sequence[RivenAuction], *, label: str | None = None,
+                weapon_names: dict[str, str] | None = None, per_page: int = 4) -> list[nextcord.Embed]:
+    """Riven contracts, `per_page` per embed. Input order is kept (already sorted)."""
+    title = f"{label or item.name}: riven contracts"
+    if not auctions:
+        return [_embed(title, url=item.url, description="No riven contracts match your filters.",
+                       thumb=item.image_url)]
+    pages = []
+    for n, group in enumerate(chunk(list(auctions), per_page)):
+        blocks = [_riven_block(i, a, (weapon_names or {}).get(a.weapon))
+                  for i, a in enumerate(group, start=n * per_page + 1)]
+        summary = f"**{len(auctions)}** riven contract{'s' if len(auctions) != 1 else ''} \u00B7 cheapest first"
+        pages.append(_embed(title, url=item.url, description=summary + "\n\n" + "\n\n".join(blocks),
+                            thumb=item.image_url))
     return pages
 
 
