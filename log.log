@@ -9,3 +9,4 @@
 2026-10-19 21:20:20,215 | INFO     | warframebot | Locally defined application commands (2): wf, wm
 2026-10-19 21:20:20,366 | INFO     | nextcord.state | nextcord.ConnectionState: Registering command with signature ('wm', 1, None)
 2026-10-19 21:20:20,509 | INFO     | warframebot | Synced application commands globally. If '/wf' doesn't show up immediately, give it a few minutes (Discord's global command cache can take a little while to propagate) and restart your Discord client (Ctrl+R).
+2026-10-19 21:25:17,632 | INFO     | nextcord.http | Allowed 1 rate limits to be garbage collected.
