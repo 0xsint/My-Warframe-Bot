@@ -4,6 +4,7 @@ aiohttp>=3.9
 beautifulsoup4>=4.12
 lxml>=5.0              # HTML parser used by wiki/parser.py
 python-dotenv>=1.0
+cryptography>=42.0   # encrypts tokens saved by /wm link
 
 # Optional REST API (api/main.py)
 fastapi>=0.110

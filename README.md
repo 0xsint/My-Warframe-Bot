@@ -3,7 +3,7 @@
 A Discord **user-installable app** for WARFRAME players, with two command groups:
 
 - **`/wf`**: the official [WARFRAME Wiki](https://wiki.warframe.com). Warframes, weapons, mods, arcanes, companions, enemies, relics, quests and abilities, plus drop tables, side-by-side comparisons, search and random pages.
-- **`/wm`**: [warframe.market](https://warframe.market). Pricing advice, buyers and sellers with copy-paste whispers, item facts, set-vs-parts value, 90-day history, ducat deals, market trends, player profiles, and riven / Kuva Lich / Sister of Parvos contracts. The owner can also post and manage their own listings and online status.
+- **`/wm`**: [warframe.market](https://warframe.market). Pricing advice, buyers and sellers with copy-paste whispers, item facts, set-vs-parts value, 90-day history, ducat deals, market trends, player profiles, and riven / Kuva Lich / Sister of Parvos contracts. Anyone can **link their own warframe.market account** with `/wm link` and then post and manage their listings and online status from Discord.
 
 The same market logic is also served by a **REST API** (FastAPI), so the API and the bot always show the same numbers.
 
@@ -83,10 +83,13 @@ Most commands take an optional `platform` (PC, PlayStation, Xbox, Switch, Mobile
 | `/wm lich weapon [element] [min_damage] [ephemera] [max_price]` | Kuva Lich weapon contracts (Kuva weapons) |
 | `/wm sister weapon [element] [min_damage] [ephemera] [max_price]` | Sister of Parvos weapon contracts (Tenet weapons) |
 
-**Owner only** (your Discord ID must be in `OWNER_ID`; these act on *your* warframe.market account):
+**Your account.** Each Discord user links their own warframe.market account. The commands below then act only on that account, and all replies are private.
 
 | Command | What it does |
 | --- | --- |
+| `/wm link [method]` | Opens a private form. Paste your warframe.market **JWT cookie** (default), or sign in with **email + password** (used once; only the resulting token is kept). The bot checks it works before saving |
+| `/wm account` | Which warframe.market account your commands use |
+| `/wm unlink` | Deletes your stored token |
 | `/wm list item price [quantity] [order_type] [rank] [per_trade] [charges] [subtype] [amber_stars] [cyan_stars] [visible]` | Post a listing |
 | `/wm update_order order_id [...]` | Change price, quantity, visibility, rank, … |
 | `/wm sold order_id [quantity]` | Mark a trade as done, so it counts in warframe.market's statistics |
@@ -95,6 +98,10 @@ Most commands take an optional `platform` (PC, PlayStation, Xbox, Switch, Mobile
 | `/wm status status [minutes]` | Show as in game / online / invisible on warframe.market |
 
 `order_id` autocompletes from your own listings (labelled like `SELL Serration · 20p ×1`), so you never need to copy IDs.
+
+To get your JWT cookie: sign in at warframe.market in a browser, press F12, open *Application* (Chrome) or *Storage* (Firefox) → *Cookies* → `warframe.market`, and copy the value of `JWT`. Pasting `JWT=...` or with quotes is fine.
+
+The bot owner (`OWNER_ID`) can skip linking: their commands fall back to the account in `.env` (`WFM_JWT`, or `WFM_EMAIL` + `WFM_PASSWORD`).
 
 ---
 
@@ -105,8 +112,8 @@ See [`ENVIRONMENT_VARIABLES.txt`](ENVIRONMENT_VARIABLES.txt) for details and [`.
 | Variable | Needed for |
 | --- | --- |
 | `DISCORD_TOKEN` | Always |
-| `OWNER_ID` | Owner-only `/wm` commands |
-| `WFM_JWT` *or* `WFM_EMAIL` + `WFM_PASSWORD` | Owner-only `/wm` commands |
+| `WFBOT_SECRET_KEY`, `WFBOT_DATA_DIR` | Optional: encryption key and folder for `/wm link` (auto-generated `data/secret.key` otherwise) |
+| `OWNER_ID` + `WFM_JWT` *or* `WFM_EMAIL` + `WFM_PASSWORD` | Optional: lets the owner use an account from `.env` without `/wm link` |
 | `WFM_PLATFORM`, `LOG_LEVEL`, `LOG_FILE` | Optional |
 | `WFBOT_API_KEY`, `WFBOT_CORS` | Optional, REST API only |
 
@@ -168,7 +175,9 @@ market/
   analysis.py          seller report (price tiers, tips, whispers)
   insights.py          sets, history, ducat deals, trends, lich/sister filters
   riven.py             riven filters and stat matching
-  seller.py            your account: listings, close, delete, status (owner only)
+  seller.py            one account: listings, close, delete, status
+  accounts.py          /wm link storage: per-user tokens, encrypted (Fernet)
+  link_ui.py           /wm link forms and account embeds
   embeds.py            every /wm embed
 core/fuzzy.py          forgiving name search (exact > prefix > substring > words > typo)
 ui/                    SectionView (dropdown + Prev/Next + link buttons), text helpers
@@ -221,16 +230,17 @@ New commands can take a few minutes to show up in Discord. Restart your Discord 
 ## Troubleshooting
 
 - **Commands don't show up**: re-check the Installation tab scopes, then wait a few minutes and press Ctrl+R. The log says if Discord refused the sync (403).
-- **"Only the bot owner can manage listings"**: put your Discord user ID in `OWNER_ID`.
-- **"warframe.market rejected the token (401)"**: `WFM_JWT` expired. Copy a fresh `JWT` cookie from your browser.
+- **"No warframe.market account is linked to you"**: run `/wm link`.
+- **"warframe.market rejected the token (401)"**: the token expired. Run `/wm link` again with a fresh `JWT` cookie.
 - **"warframe.market rate limit hit"**: wait a moment. The bot already spaces its requests and retries once.
 - **"WARFRAME Wiki blocked this request" (403)**: Cloudflare is challenging the server's IP. This is common on cloud hosts; a home connection usually works.
 
 ## Security notes
 
-- The owner commands are gated by `OWNER_ID`, because a user-installed app can be run by anyone.
-- Your warframe.market token and password are never logged. The token lives in its own session, separate from public lookups.
-- Owner command replies are ephemeral (only you see them).
+- Account commands only ever act on the caller's own linked account (or, for `OWNER_ID`, the `.env` account), because a user-installed app can be run by anyone.
+- Linked tokens are encrypted at rest (`data/accounts.json`, key in `WFBOT_SECRET_KEY` or `data/secret.key`). Passwords are never stored, and tokens and passwords are never logged. Each account gets its own HTTP session, separate from public lookups.
+- Whoever runs the bot holds the key, so they *could* use linked tokens. Only link your account to a bot run by someone you trust, and `/wm unlink` plus signing out of warframe.market ends access.
+- Account command replies are ephemeral (only you see them).
 - The REST API is read-only. Set `WFBOT_API_KEY` before exposing it publicly.
 
 ## Credits

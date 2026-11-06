@@ -17,8 +17,10 @@ Anyone:
     /wm lich      Kuva Lich weapon contracts (element, damage, ephemera)
     /wm sister    Sister of Parvos (Tenet) weapon contracts
 
-Owner only (OWNER_ID in .env; acts on YOUR warframe.market account):
+Your own account (link it first with /wm link; each Discord user links their own):
+    /wm link, /wm unlink, /wm account
     /wm list, /wm update_order, /wm sold, /wm unlist, /wm my_orders, /wm status
+The bot owner (OWNER_ID) may instead use the account set in .env without linking.
 """
 from __future__ import annotations
 
@@ -34,6 +36,7 @@ from nextcord import Interaction, SlashOption
 from nextcord.ext import commands
 
 from market.analysis import build_report
+from market.accounts import AccountStore
 from market.client import ItemNotFound, MarketError, WarframeMarketClient
 from market.embeds import (
     MARKET_FOOTER,
@@ -66,6 +69,7 @@ from market.insights import (
     recent_trends,
     set_report,
 )
+from market.link_ui import PasswordModal, TokenModal, account_embed
 from market.riven import POLARITIES, RivenFilter, filter_rivens, stat_suggestions, unknown_stats
 from market.seller import STATUSES, MarketSeller, SellerError
 from ui.paginator import Section, SectionView, view_kwargs
@@ -85,7 +89,9 @@ SIDE_CHOICES = {"Selling": "sell", "Buying": "buy"}
 RIVEN_POLARITY_CHOICES = {p.title(): p for p in POLARITIES}
 ELEMENT_CHOICES = {e.title(): e for e in ELEMENTS}
 STATUS_CHOICES = {"In game": "ingame", "Online": "online", "Invisible": "invisible"}
-NOT_SET_UP = "Listing isn't set up: add WFM_JWT (or WFM_EMAIL + WFM_PASSWORD) to .env."
+NOT_LINKED = ("No warframe.market account is linked to you. Use `/wm link` first: it opens a private "
+              "form for your warframe.market token (or email + password).")
+LINK_METHOD_CHOICES = {"Paste my JWT token (recommended)": "token", "Sign in with email + password": "password"}
 
 
 # ------------------------------------------------------------------ options
@@ -108,9 +114,8 @@ def _owner_ids() -> set[int]:
 
 
 def _is_owner(interaction: Interaction) -> bool:
-    """This is a user-installable app, so *anyone* can run its commands. The
-    listing commands act on YOUR warframe.market account and must never be open
-    to everyone. OWNER_ID in .env: your Discord user id (comma-separate for several)."""
+    """OWNER_ID in .env (comma-separate for several). The owner may use the account
+    in .env without /wm link; everybody else acts only on the account they linked."""
     return interaction.user is not None and interaction.user.id in _owner_ids()
 
 
@@ -125,8 +130,10 @@ class MarketCommands(commands.Cog):
         self.bot = bot
         self._own_session: aiohttp.ClientSession | None = None
         self._own_client: WarframeMarketClient | None = None
-        self._seller: MarketSeller | None = None
-        self._my_orders_cache: tuple[float, list[dict]] = (0.0, [])
+        self._sellers: dict[int, MarketSeller] = {}        # discord id -> linked account
+        self._owner_seller: MarketSeller | None = None      # account from .env
+        self._accounts: AccountStore | None = None
+        self._my_orders_cache: dict[int, tuple[float, list[dict]]] = {}
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -140,23 +147,57 @@ class MarketCommands(commands.Cog):
         return self._own_client
 
     @property
-    def seller(self) -> MarketSeller:
-        if self._seller is None:
-            self._seller = MarketSeller(self.client)
-        return self._seller
+    def accounts(self) -> AccountStore:
+        if self._accounts is None:
+            self._accounts = AccountStore()
+        return self._accounts
+
+    @property
+    def owner_seller(self) -> MarketSeller:
+        if self._owner_seller is None:
+            self._owner_seller = MarketSeller.from_env(self.client)
+        return self._owner_seller
+
+    def seller_for(self, interaction: Interaction) -> MarketSeller | None:
+        """The account this user's commands act on: the one they linked, else (for
+        the bot owner only) the one in .env, else None."""
+        uid = interaction.user.id if interaction.user is not None else None
+        if uid is None:
+            return None
+        token = self.accounts.token(uid)
+        if token:
+            seller = self._sellers.get(uid)
+            if seller is None or seller.token != token:
+                if seller is not None:
+                    asyncio.create_task(seller.close())
+                seller = self._sellers[uid] = MarketSeller(self.client, token=token)
+            return seller
+        if _is_owner(interaction) and self.owner_seller.configured:
+            return self.owner_seller
+        return None
+
+    async def _forget(self, uid: int) -> None:
+        """Drop cached state after a user links or unlinks."""
+        self._my_orders_cache.pop(uid, None)
+        seller = self._sellers.pop(uid, None)
+        if seller is not None:
+            await seller.close()
+
+    def _all_sellers(self) -> list[MarketSeller]:
+        return [*self._sellers.values(), *([self._owner_seller] if self._owner_seller else [])]
 
     async def aclose(self) -> None:
         """Called by bot.close(): cogs aren't unloaded on a normal shutdown."""
-        if self._seller is not None:
-            await self._seller.close()
+        for seller in self._all_sellers():
+            await seller.close()
         if self._own_session and not self._own_session.closed:
             await self._own_session.close()
 
     def cog_unload(self) -> None:
         if self._own_session and not self._own_session.closed:
             self.bot.loop.create_task(self._own_session.close())
-        if self._seller is not None:
-            self.bot.loop.create_task(self._seller.close())
+        for seller in self._all_sellers():
+            self.bot.loop.create_task(seller.close())
 
     async def _guard(self, interaction: Interaction, body: Callable[[], Awaitable[None]], *,
                      what: str, ephemeral: bool = False) -> None:
@@ -175,17 +216,14 @@ class MarketCommands(commands.Cog):
             await interaction.followup.send("Unexpected error. The bot owner can check the log.",
                                             ephemeral=True)
 
-    async def _owner_gate(self, interaction: Interaction) -> bool:
-        """True when the caller may touch the owner's account; replies otherwise."""
-        if not _is_owner(interaction):
-            await interaction.response.send_message(
-                "Only the bot owner can manage listings.", ephemeral=True)
-            return False
-        if not self.seller.configured:
-            await interaction.response.send_message(NOT_SET_UP, ephemeral=True)
-            return False
+    async def _account_gate(self, interaction: Interaction) -> MarketSeller | None:
+        """The caller's own account (deferring the reply), or None after telling them to link one."""
+        seller = self.seller_for(interaction)
+        if seller is None:
+            await interaction.response.send_message(NOT_LINKED, ephemeral=True)
+            return None
         await interaction.response.defer(ephemeral=True)
-        return True
+        return seller
 
     # --------------------------------------------------------------- group
     @nextcord.slash_command(name="wm", description="warframe.market prices, orders, contracts and players",
@@ -466,8 +504,30 @@ class MarketCommands(commands.Cog):
         await self._weapon_contracts(interaction, "sister", weapon, element, min_damage, ephemera, max_price,
                                      online_only, platform)
 
-    # ========================================================= owner only
-    @wm.subcommand(name="list", description="Post a listing on warframe.market (owner only)")
+    # ====================================================== your account
+    @wm.subcommand(name="link", description="Link your warframe.market account (private form; token stored encrypted)")
+    async def link(self, interaction: Interaction,
+                   method: str = SlashOption(description="How to sign in (default: paste your JWT token)",
+                                             required=False, default="token", choices=LINK_METHOD_CHOICES)):
+        modal_cls = PasswordModal if method == "password" else TokenModal
+        await interaction.response.send_modal(modal_cls(self.accounts, self.client, on_linked=self._forget))
+
+    @wm.subcommand(name="unlink", description="Remove your linked warframe.market account from this bot")
+    async def unlink(self, interaction: Interaction):
+        removed = self.accounts.unlink(interaction.user.id)
+        await self._forget(interaction.user.id)
+        text = ("Unlinked. Your token was deleted from this bot. To also end that session, sign out "
+                "of warframe.market in your browser." if removed else "You had no linked account.")
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @wm.subcommand(name="account", description="Which warframe.market account your commands use")
+    async def account(self, interaction: Interaction):
+        acc = self.accounts.get(interaction.user.id)
+        owner = _is_owner(interaction) and self.owner_seller.configured
+        await interaction.response.send_message(embed=account_embed(acc, owner_fallback=owner), ephemeral=True)
+
+    # ============================================ your account: listings
+    @wm.subcommand(name="list", description="Post a listing on warframe.market (your linked account)")
     async def list_order(self, interaction: Interaction,
                          item: str = _item_option(),
                          price: int = SlashOption(description="Platinum per unit", min_value=1),
@@ -488,19 +548,20 @@ class MarketCommands(commands.Cog):
                          visible: bool = SlashOption(description="Show the listing publicly (default yes)",
                                                      required=False, default=True),
                          platform: str = _platform_option()):
-        if not await self._owner_gate(interaction):
+        seller = await self._account_gate(interaction)
+        if seller is None:
             return
 
         async def body():
             it = await self.client.resolve_item(item)
-            order = await self.seller.create_order(
+            order = await seller.create_order(
                 it, order_type=order_type, platinum=price, quantity=quantity, rank=rank,
                 per_trade=per_trade, charges=charges, subtype=(subtype or "").strip().lower() or None,
                 amber_stars=amber_stars, cyan_stars=cyan_stars, visible=visible, platform=platform)
             await interaction.followup.send(embed=listed_embed(order), ephemeral=True)
         await self._guard(interaction, body, what="post that listing")
 
-    @wm.subcommand(name="update_order", description="Change one of your listings (owner only)")
+    @wm.subcommand(name="update_order", description="Change one of your listings (your linked account)")
     async def update_order(self, interaction: Interaction,
                            order_id: str = SlashOption(description="Order id (see /wm my_orders)", autocomplete=True),
                            platinum: int = SlashOption(description="New price", required=False, min_value=1),
@@ -514,68 +575,73 @@ class MarketCommands(commands.Cog):
                            amber_stars: int = SlashOption(description="Amber stars", required=False, min_value=0),
                            cyan_stars: int = SlashOption(description="Cyan stars", required=False, min_value=0),
                            platform: str = _platform_option()):
-        if not await self._owner_gate(interaction):
+        seller = await self._account_gate(interaction)
+        if seller is None:
             return
         changes = {"type": order_type, "platinum": platinum, "quantity": quantity, "visible": visible,
                    "rank": rank, "perTrade": per_trade, "charges": charges, "amberStars": amber_stars,
                    "cyanStars": cyan_stars}
 
         async def body():
-            updated = await self.seller.update_order(order_id.strip(), platform=platform, **changes)
+            updated = await seller.update_order(order_id.strip(), platform=platform, **changes)
             changed = frozenset(k for k, v in changes.items() if v is not None)
             await interaction.followup.send(embed=updated_embed(updated, changed), ephemeral=True)
         await self._guard(interaction, body, what="update that listing")
 
-    @wm.subcommand(name="sold", description="Mark a listing as sold/bought so it counts in statistics (owner only)")
+    @wm.subcommand(name="sold", description="Mark a listing as sold/bought so it counts in statistics (your linked account)")
     async def sold(self, interaction: Interaction,
                    order_id: str = SlashOption(description="Order id (see /wm my_orders)", autocomplete=True),
                    quantity: int = SlashOption(description="How many were traded (default all)", required=False,
                                                min_value=1),
                    platform: str = _platform_option()):
-        if not await self._owner_gate(interaction):
+        seller = await self._account_gate(interaction)
+        if seller is None:
             return
 
         async def body():
-            closed = await self.seller.close_order(order_id.strip(), quantity, platform=platform)
+            closed = await seller.close_order(order_id.strip(), quantity, platform=platform)
             await interaction.followup.send(embed=closed_embed(closed), ephemeral=True)
         await self._guard(interaction, body, what="close that listing")
 
-    @wm.subcommand(name="unlist", description="Remove one of your listings (owner only)")
+    @wm.subcommand(name="unlist", description="Remove one of your listings (your linked account)")
     async def unlist_order(self, interaction: Interaction,
                            order_id: str = SlashOption(description="Order id (see /wm my_orders)", autocomplete=True),
                            platform: str = _platform_option()):
-        if not await self._owner_gate(interaction):
+        seller = await self._account_gate(interaction)
+        if seller is None:
             return
 
         async def body():
-            await self.seller.delete_order(order_id.strip(), platform=platform)
+            await seller.delete_order(order_id.strip(), platform=platform)
             await interaction.followup.send(embed=removed_embed(order_id.strip()), ephemeral=True)
         await self._guard(interaction, body, what="remove that listing")
 
-    @wm.subcommand(name="my_orders", description="All of your current listings (owner only)")
+    @wm.subcommand(name="my_orders", description="All of your current listings (your linked account)")
     async def my_orders(self, interaction: Interaction):
-        if not await self._owner_gate(interaction):
+        seller = await self._account_gate(interaction)
+        if seller is None:
             return
 
         async def body():
-            orders = await self.seller.get_my_orders()
+            orders = await seller.get_my_orders()
             await _send_view(interaction, my_orders_sections(orders), ephemeral=True,
                              placeholder="Filter orders")
         await self._guard(interaction, body, what="load your listings")
 
-    @wm.subcommand(name="status", description="Show as in game / online / invisible on warframe.market (owner only)")
+    @wm.subcommand(name="status", description="Show as in game / online / invisible on warframe.market (your linked account)")
     async def status(self, interaction: Interaction,
                      status: str = SlashOption(description="Status to show", choices=STATUS_CHOICES),
                      minutes: int = SlashOption(description="How long (default 60)", required=False, default=60,
                                                 min_value=5, max_value=720)):
-        if not await self._owner_gate(interaction):
+        seller = await self._account_gate(interaction)
+        if seller is None:
             return
 
         async def body():
             if status not in STATUSES:
                 raise SellerError("unknown status")
             try:
-                await self.seller.set_status(status, minutes=minutes)
+                await seller.set_status(status, minutes=minutes)
             except asyncio.TimeoutError as exc:
                 raise SellerError("the warframe.market websocket didn't answer") from exc
             await interaction.followup.send(embed=status_embed(status, minutes), ephemeral=True)
@@ -629,15 +695,17 @@ class MarketCommands(commands.Cog):
     sister.on_autocomplete("weapon")(_sister_ac)
 
     async def _order_id_ac(self, interaction: Interaction, current: str):
-        """Owner's own orders, labelled by item, so ids never need copy-pasting."""
-        if not _is_owner(interaction) or not self.seller.configured:
+        """The caller's own orders, labelled by item, so ids never need copy-pasting."""
+        seller = self.seller_for(interaction)
+        if seller is None:
             await interaction.response.send_autocomplete({})
             return
-        loaded, orders = self._my_orders_cache
+        uid = interaction.user.id
+        loaded, orders = self._my_orders_cache.get(uid, (0.0, []))
         if time.monotonic() - loaded > 30:                  # don't hit the API on every keystroke
             try:
-                orders = await asyncio.wait_for(self.seller.get_my_orders(), timeout=2.5)
-                self._my_orders_cache = (time.monotonic(), orders)
+                orders = await asyncio.wait_for(seller.get_my_orders(), timeout=2.5)
+                self._my_orders_cache[uid] = (time.monotonic(), orders)
             except Exception:
                 orders = []
         q = (current or "").lower()

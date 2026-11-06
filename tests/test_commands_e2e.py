@@ -1,12 +1,15 @@
 """Run each /wm and /wf command body end-to-end against fake upstreams and a
 fake Discord interaction, so a typo in a cog shows up offline."""
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+os.environ["WFBOT_DATA_DIR"] = tempfile.mkdtemp(prefix="wfbot-test-")   # never write ./data in tests
 
 import nextcord  # noqa: E402
 from nextcord.ext import commands  # noqa: E402
@@ -161,11 +164,12 @@ def test_market_errors_are_friendly():
     assert "No warframe.market user" in text(call("wm", "user", name="nobody"))
 
 
-def test_owner_commands_refuse_strangers(monkeypatch):
+def test_account_commands_need_a_linked_account(monkeypatch):
     monkeypatch.setenv("OWNER_ID", "999")
+    monkeypatch.setenv("WFM_JWT", "owner-token")          # the owner's .env account is not for others
     for name, kw in (("list", {"item": "serration", "price": 5}), ("my_orders", {}),
                      ("unlist", {"order_id": "x"}), ("status", {"status": "ingame"})):
-        assert "Only the bot owner" in text(call("wm", name, **kw))
+        assert "/wm link" in text(call("wm", name, **kw))
 
 
 def test_wiki_commands_end_to_end():

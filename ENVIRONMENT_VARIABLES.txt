@@ -18,11 +18,12 @@ Summary
   Variable          Used by          Required?
   ----------------  ---------------  --------------------------------------
   DISCORD_TOKEN     bot.py           YES (bot exits without it)
-  OWNER_ID          /wm owner cmds   YES for /wm list, update_order, sold,
-                                     unlist, my_orders, status
-  WFM_JWT           market/seller    Needed for owner commands (preferred)
-  WFM_EMAIL         market/seller    Alternative to WFM_JWT
-  WFM_PASSWORD      market/seller    Alternative to WFM_JWT
+  OWNER_ID          /wm account cmds No (lets the owner use WFM_* below)
+  WFM_JWT           market/seller    No (owner's account, preferred)
+  WFM_EMAIL         market/seller    No (alternative to WFM_JWT)
+  WFM_PASSWORD      market/seller    No (alternative to WFM_JWT)
+  WFBOT_SECRET_KEY  /wm link         No (auto-generated into data/secret.key)
+  WFBOT_DATA_DIR    /wm link         No (default "data")
   WFM_PLATFORM      bot.py           No (default "pc")
   LOG_LEVEL         bot.py           No (default "INFO")
   LOG_FILE          bot.py           No (default "log.log"; empty = console only)
@@ -42,11 +43,10 @@ DISCORD_TOKEN
     Security    : Treat it like a password. If it leaks, reset it.
 
 OWNER_ID
-    Discord user ID(s) allowed to run the owner-only /wm commands, which act
-    on YOUR warframe.market account: list, update_order, sold, unlist,
-    my_orders, status. Because the bot is a user-installable app, anyone can
-    run its commands, so this gate is what protects your account.
-    If unset or empty, nobody passes the check.
+    Discord user ID(s) whose account commands (list, update_order, sold,
+    unlist, my_orders, status) may use the WFM_* account below without
+    running /wm link. Everyone else, and the owner once linked, acts only on
+    the account they linked themselves with /wm link.
     Format      : one ID, or several separated by commas.
     Example     : OWNER_ID="123456789012345678,987654321098765432"
     Where to get: Discord -> Settings -> Advanced -> Developer Mode, then
@@ -63,13 +63,32 @@ LOG_LEVEL / LOG_FILE
 
 
 ------------------------------------------------------------------------------
-WARFRAME.MARKET ACCOUNT (owner-only commands)
+LINKED ACCOUNTS (/wm link)
 ------------------------------------------------------------------------------
 
-Used by market/seller.py. The seller is "configured" when WFM_JWT is set, OR
-when both WFM_EMAIL and WFM_PASSWORD are set. Otherwise the owner commands
-reply "Listing isn't set up". WFM_JWT is tried first. Tokens are never
-written to the log.
+Each Discord user links their own warframe.market account with /wm link (a
+private form: paste the JWT cookie, or sign in with email + password, in
+which case only the resulting token is kept). Tokens are stored encrypted in
+<WFBOT_DATA_DIR>/accounts.json. Tokens and passwords are never logged.
+
+WFBOT_SECRET_KEY
+    Fernet key that encrypts the stored tokens. If unset, one is generated
+    into <WFBOT_DATA_DIR>/secret.key on first use. If the key is lost or
+    changed, stored links can't be read and users must /wm link again.
+    Make one: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    Security : whoever has the key and accounts.json can act on the linked
+               accounts. Keep both private and backed up.
+
+WFBOT_DATA_DIR
+    Folder for accounts.json and secret.key. Default "data" (in .gitignore).
+
+
+------------------------------------------------------------------------------
+OWNER'S WARFRAME.MARKET ACCOUNT FROM .env (optional)
+------------------------------------------------------------------------------
+
+Used by the OWNER_ID users when they haven't linked an account. The account
+is "configured" when WFM_JWT is set, OR both WFM_EMAIL and WFM_PASSWORD are.
 
 WFM_JWT
     Session token for your warframe.market account. Preferred, because
@@ -124,14 +143,11 @@ TROUBLESHOOTING
     The variable is missing or .env is not in the folder you launched the
     bot from. Check the file is named exactly ".env" (not ".env.txt").
 
-"Only the bot owner can manage listings."
-    Your Discord user ID is not in OWNER_ID.
+"No warframe.market account is linked to you."
+    Run /wm link. (Owners can alternatively set OWNER_ID + WFM_JWT.)
 
-"Listing isn't set up: add WFM_JWT (or WFM_EMAIL + WFM_PASSWORD) to .env."
-    Set WFM_JWT, or both WFM_EMAIL and WFM_PASSWORD, then restart the bot.
-
-"warframe.market rejected the token (401)"
-    WFM_JWT expired. Copy a fresh JWT cookie from your browser.
+"warframe.market rejected the token (401): it has expired."
+    Run /wm link again with a fresh JWT cookie (or update WFM_JWT).
 
 API returns 401 "Missing or invalid X-API-Key"
     WFBOT_API_KEY is set. Send the header  X-API-Key: <value>.
