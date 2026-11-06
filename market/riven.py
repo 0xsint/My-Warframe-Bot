@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
 from .client import RivenAuction, _norm
+from .models import asking_price  # noqa: F401  (re-exported)
 
 POLARITIES = ("madurai", "vazarin", "naramon")
 MAX_RANK = 8
@@ -25,14 +26,6 @@ class RivenFilter:
     negative: Optional[str] = None      # must have this stat as its negative (curse)
     max_price: Optional[int] = None     # highest buyout (or bid) to keep
     online_only: bool = True            # keep sellers who are in game or online
-
-
-def asking_price(auction: RivenAuction) -> Optional[int]:
-    """The number a buyer pays: the buyout when set, else the current top bid
-    (or the starting bid when nobody has bid yet)."""
-    if auction.buyout_price:
-        return auction.buyout_price
-    return auction.top_bid or auction.starting_price or None
 
 
 def _stat_matches(wanted: str, url_name: str) -> bool:

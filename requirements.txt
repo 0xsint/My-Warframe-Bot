@@ -1,6 +1,10 @@
-# add these to your existing requirements.txt
+# Bot
 nextcord>=3.0          # IntegrationType / InteractionContextType (user-install commands)
 aiohttp>=3.9
 beautifulsoup4>=4.12
+lxml>=5.0              # HTML parser used by wiki/parser.py
+python-dotenv>=1.0
+
+# Optional REST API (api/main.py)
 fastapi>=0.110
 uvicorn[standard]>=0.29
