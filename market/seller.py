@@ -88,23 +88,38 @@ def _listed(raw: dict[str, Any], item: Optional[Item]) -> ListedOrder:
 
 
 class MarketSeller:
-    """``market`` is the shared public client, used to turn item ids into names
-    without extra API calls."""
+    """One warframe.market account.
 
-    def __init__(self, market: WarframeMarketClient) -> None:
+    ``market`` is the shared public client, used to turn item ids into names
+    without extra API calls. Credentials are passed in explicitly (a linked
+    user's token) or, with :meth:`from_env`, read from .env (the bot owner)."""
+
+    def __init__(self, market: WarframeMarketClient, *, token: str | None = None,
+                 email: str | None = None, password: str | None = None) -> None:
         self.market = market
         self._session: aiohttp.ClientSession | None = None
-        self._jwt: str | None = os.getenv("WFM_JWT") or None
-        self._static_token = self._jwt is not None      # a pasted token can't be refreshed
+        self._jwt: str | None = token or None
+        self._email, self._password = email or None, password or None
+        self._static_token = self._jwt is not None and not (self._email and self._password)
         self._csrf: str | None = None
         self._lock = asyncio.Lock()
         self._last = 0.0
         self._status_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------ plumbing
+    @classmethod
+    def from_env(cls, market: WarframeMarketClient) -> "MarketSeller":
+        """The bot owner's account from WFM_JWT, or WFM_EMAIL + WFM_PASSWORD."""
+        return cls(market, token=os.getenv("WFM_JWT"), email=os.getenv("WFM_EMAIL"),
+                   password=os.getenv("WFM_PASSWORD"))
+
     @property
     def configured(self) -> bool:
-        return bool(self._jwt or (os.getenv("WFM_EMAIL") and os.getenv("WFM_PASSWORD")))
+        return bool(self._jwt or (self._email and self._password))
+
+    @property
+    def token(self) -> str | None:
+        return self._jwt
 
     def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -180,9 +195,9 @@ class MarketSeller:
         return str(data)[:300]
 
     async def login(self) -> str:
-        email, password = os.getenv("WFM_EMAIL"), os.getenv("WFM_PASSWORD")
+        email, password = self._email, self._password
         if not (email and password):
-            raise SellerError("Set WFM_JWT, or WFM_EMAIL and WFM_PASSWORD, in .env")
+            raise SellerError("no warframe.market credentials: link an account with /wm link")
         if self._csrf is None:
             await self._refresh_csrf()
         body = {"auth_type": "header", "email": email, "password": password, "device_id": "warframebot"}
@@ -221,8 +236,18 @@ class MarketSeller:
                 self._jwt = await self.login()
                 continue
             if status == 401:
-                raise SellerError("warframe.market rejected the token (401). Copy a fresh JWT cookie into WFM_JWT.")
+                raise SellerError("warframe.market rejected the token (401): it has expired. "
+                                  "Link your account again with /wm link.")
             raise SellerError(f"{status}: {self._short(data)}")
+
+    async def whoami(self) -> dict:
+        """The signed-in user ({"ingameName", "slug", "platform", ...}). Also proves the
+        credentials work: raises SellerError when they don't."""
+        data = await self._call("GET", "/me")
+        me = data.get("data") or {}
+        if not isinstance(me, dict) or not (me.get("ingameName") or me.get("id")):
+            raise SellerError("warframe.market didn't return an account for these credentials")
+        return me
 
     async def _item_for(self, item_id: str) -> Optional[Item]:
         try:

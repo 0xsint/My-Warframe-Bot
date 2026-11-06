@@ -99,7 +99,7 @@ def test_static_token_401_explains_and_token_never_logged(caplog):
         try:
             run(s.delete_order("o1"))
         except SellerError as exc:
-            assert "fresh JWT" in str(exc)
+            assert "/wm link" in str(exc)
         else:
             raise AssertionError("expected SellerError")
     assert "secret-token-value" not in caplog.text
