@@ -9,8 +9,6 @@ called on a normal Ctrl+C / bot.close(), so this helper hooks bot.close().
 """
 from __future__ import annotations
 
-from typing import Optional
-
 # where an existing session might already live on the bot (first open one wins)
 DEFAULT_SOURCES = ("session", "wiki.session", "wiki._session", "http_session")
 

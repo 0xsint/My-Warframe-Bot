@@ -11,10 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
-from .client import LichAuction, RivenAuction, _norm
+from .client import RivenAuction, _norm
+from .models import asking_price  # noqa: F401  (re-exported)
 
 POLARITIES = ("madurai", "vazarin", "naramon")
-ELEMENTS = ("heat", "cold", "electricity", "toxin", "impact", "puncture", "slash", "radiation")
 MAX_RANK = 8
 
 
@@ -26,14 +26,6 @@ class RivenFilter:
     negative: Optional[str] = None      # must have this stat as its negative (curse)
     max_price: Optional[int] = None     # highest buyout (or bid) to keep
     online_only: bool = True            # keep sellers who are in game or online
-
-
-def asking_price(auction: "RivenAuction | LichAuction") -> Optional[int]:
-    """The number a buyer pays: the buyout when set, else the current top bid
-    (or the starting bid when nobody has bid yet)."""
-    if auction.buyout_price:
-        return auction.buyout_price
-    return auction.top_bid or auction.starting_price or None
 
 
 def _stat_matches(wanted: str, url_name: str) -> bool:
@@ -107,31 +99,3 @@ def filter_rivens(auctions: Iterable[RivenAuction], flt: RivenFilter) -> list[Ri
             continue
         kept.append(a)
     return sort_rivens(kept)
-
-
-@dataclass(frozen=True)
-class LichFilter:
-    element: Optional[str] = None
-    min_damage: Optional[int] = None
-    ephemera: Optional[bool] = None     # True = must have one, False = must not
-    max_price: Optional[int] = None
-    online_only: bool = True
-
-
-def filter_liches(auctions: Iterable[LichAuction], flt: LichFilter) -> list[LichAuction]:
-    """Matching Kuva Lich / Sister auctions: cheapest first, then highest damage."""
-    kept = []
-    for a in auctions:
-        if flt.online_only and not a.is_online:
-            continue
-        if flt.element and a.element.lower() != flt.element.lower():
-            continue
-        if flt.min_damage is not None and a.damage < flt.min_damage:
-            continue
-        if flt.ephemera is not None and a.ephemera != flt.ephemera:
-            continue
-        price = asking_price(a)
-        if flt.max_price is not None and (price is None or price > flt.max_price):
-            continue
-        kept.append(a)
-    return sorted(kept, key=lambda a: (asking_price(a) is None, asking_price(a) or 0, -a.damage))

@@ -7,7 +7,7 @@ and the dropdown lists every other block of the page (the infobox groups such as
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import nextcord
 
@@ -79,7 +79,9 @@ def _ordered_infobox(page: WikiPage, kind: str) -> list[InfoboxSection]:
     return first + rest
 
 
-def build_page_view(page: WikiPage, kind: Optional[str] = None) -> SectionView:
+def build_page_view(page: WikiPage, kind: Optional[str] = None, *,
+                    links: Sequence[tuple[str, str]] = (), start: Optional[str] = None) -> SectionView:
+    """``links``: extra link buttons; ``start``: section label to open first."""
     kind = kind or detect_kind(page)
     sections = [Section(OVERVIEW, [_OVERVIEW_BUILDERS[kind](page)], description="Summary and key stats")]
 
@@ -100,4 +102,20 @@ def build_page_view(page: WikiPage, kind: Optional[str] = None) -> SectionView:
             sections.append(Section(label, pages))
 
     return SectionView(sections, footer_text=FOOTER_TEXT, footer_icon=FOOTER_ICON,
-                       select_placeholder="Pick a section")
+                       select_placeholder="Pick a section", links=links, start=start)
+
+
+DROP_HEADINGS = ("acquisition", "drop locations", "drops", "drop tables", "obtaining", "locations",
+                 "rewards", "relics", "drop table", "blueprint")
+
+
+def drops_section(page: WikiPage) -> Optional[str]:
+    """Label of the section that says where to get the thing, if the page has one."""
+    for want in DROP_HEADINGS:
+        for heading in page.article_sections:
+            if heading.lower().startswith(want):
+                return heading
+        for sec in page.sections:
+            if sec.header.lower().startswith(want):
+                return sec.header
+    return None

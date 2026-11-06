@@ -57,8 +57,8 @@ def install() -> None:
         def values(self): return self._selected_values
 
     class Button:
-        def __init__(self, *, label=None, style=None, **kw):
-            self.label, self.style, self.disabled, self.callback = label, style, False, None
+        def __init__(self, *, label=None, style=None, url=None, **kw):
+            self.label, self.style, self.url, self.disabled, self.callback = label, style, url, False, None
 
     class View:
         def __init__(self, *, timeout=180):
@@ -68,6 +68,6 @@ def install() -> None:
         def stop(self): self.stopped = True
 
     nc.Embed, nc.SelectOption, nc.Interaction = Embed, SelectOption, object
-    nc.ButtonStyle = _Obj(secondary="secondary")
+    nc.ButtonStyle = _Obj(secondary="secondary", link="link")
     nc.ui = _Obj(View=View, Select=Select, Button=Button)
     sys.modules["nextcord"] = nc

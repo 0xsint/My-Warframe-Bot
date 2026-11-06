@@ -1,30 +1,79 @@
-"""Small async client for the warframe.market public API (v2).
+"""Async client for the public (read-only) warframe.market API.
 
-* No API key needed for read-only endpoints.
-* warframe.market asks for <= 3 requests/second, so every call goes through a
-  global limiter, and responses are cached for a short time.
-* Field access is defensive (.get with fallbacks): the API has changed shape
-  before, and one missing key should not take the whole command down.
+* No account or API key is needed for anything in this file.
+* warframe.market asks for at most 3 requests/second, so every call goes
+  through one global limiter. Responses are cached briefly, and the big
+  catalogues (item list, riven/lich/sister weapons, ...) for 6 hours.
+* HTTP 429 and 5xx answers are retried once after a short pause.
 
-Used by both the Discord cog (cogs/market_commands.py) and the FastAPI app
-(api/main.py), so the two never disagree about the numbers.
+Endpoints used (v2 unless noted):
+    /items                          item index (names, slugs, ducats, vaulted, ...)
+    /item/{slug}                    full item details (tax, MR, rarity, wiki link, ...)
+    /item/{slug}/set                every part of the set an item belongs to
+    /orders/item/{slug}             all orders for an item
+    /orders/item/{slug}/top         best 5 online buy + sell orders (with rank filters)
+    /orders/recent                  the 500 most recently posted orders
+    /user/{slug}, /orders/user/{slug}   public profile + listings of a player
+    /riven/weapons, /riven/attributes   riven catalogue (incl. disposition)
+    /lich/weapons|ephemeras|quirks, /sister/weapons|ephemeras
+    v1 /items/{slug}/statistics     48 hour and 90 day sales history
+    v1 /auctions/search             riven / lich / sister contracts
+
+Used by the Discord cogs and the FastAPI app, so they never disagree.
 """
 from __future__ import annotations
 
 import asyncio
-import difflib
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
+
+from core.fuzzy import _norm, _rank_items  # noqa: F401  (_norm is re-exported for market.riven)
+
+from .models import (  # re-exported: older code imports these from market.client
+    ASSET_BASE,
+    ONLINE_STATUSES,
+    CatalogEntry,
+    Item,
+    ItemDetail,
+    Order,
+    RivenAttribute,
+    RivenAuction,
+    RivenWeapon,
+    StatPoint,
+    UserProfile,
+    WeaponAuction,
+    parse_catalog_entry,
+    parse_item,
+    parse_item_detail,
+    parse_order,
+    parse_riven_auction,
+    parse_riven_weapon,
+    parse_stat_point,
+    parse_user,
+    parse_weapon_auction,
+)
 
 API_V2 = "https://api.warframe.market/v2"
 API_V1 = "https://api.warframe.market/v1"
-ASSET_BASE = "https://warframe.market/static/assets/"
-USER_AGENT = "WarframeBOT/1.0 (Discord bot; https://github.com/0xsint/My-Warframe-Bot)"
+USER_AGENT = "WarframeBOT/2.0 (Discord bot; https://github.com/0xsint/My-Warframe-Bot)"
 
-PLATFORMS = ("pc", "ps4", "xbox", "switch")
-ONLINE_STATUSES = {"ingame", "online"}
+PLATFORMS = ("pc", "ps4", "xbox", "switch", "mobile")
+CATALOG_TTL = 6 * 3600
+
+T = TypeVar("T")
+
+# old private names, kept so existing imports keep working
+_parse_item = parse_item
+_parse_order = parse_order
+_parse_riven_auction = parse_riven_auction
+
+__all__ = [
+    "API_V1", "API_V2", "ASSET_BASE", "ONLINE_STATUSES", "PLATFORMS", "USER_AGENT",
+    "CatalogEntry", "Item", "ItemDetail", "ItemNotFound", "MarketError", "Order",
+    "RivenAttribute", "RivenAuction", "RivenWeapon", "StatPoint", "UserProfile",
+    "WarframeMarketClient", "WeaponAuction",
+]
 
 
 class MarketError(Exception):
@@ -37,115 +86,9 @@ class ItemNotFound(MarketError):
     pass
 
 
-@dataclass(frozen=True)
-class Item:
-    slug: str
-    name: str
-    icon: Optional[str] = None
-    thumb: Optional[str] = None
-    tags: tuple[str, ...] = ()
-    max_rank: Optional[int] = None
-
-    @property
-    def image_url(self) -> Optional[str]:
-        path = self.icon or self.thumb
-        return ASSET_BASE + path.lstrip("/") if path else None
-
-    @property
-    def url(self) -> str:
-        return f"https://warframe.market/items/{self.slug}"
-
-
-@dataclass
-class Order:
-    id: str
-    type: str                       # "sell" | "buy"
-    platinum: int
-    quantity: int
-    rank: Optional[int]
-    seller: str                     # in-game name
-    status: str                     # "ingame" | "online" | "offline"
-    reputation: int = 0
-    platform: str = ""
-    crossplay: bool = False
-    updated_at: str = ""
-
-    @property
-    def is_online(self) -> bool:
-        return self.status in ONLINE_STATUSES
-
-
-def _parse_order(raw: dict[str, Any]) -> Optional[Order]:
-    user = raw.get("user") or {}
-    plat = raw.get("platinum")
-    if plat is None or not raw.get("type"):
-        return None
-    if raw.get("visible") is False:
-        return None
-    return Order(
-        id=str(raw.get("id", "")),
-        type=str(raw["type"]),
-        platinum=int(plat),
-        quantity=int(raw.get("quantity") or 1),
-        rank=raw.get("rank"),
-        seller=str(user.get("ingameName") or user.get("ingame_name") or "unknown"),
-        status=str(user.get("status") or "offline"),
-        reputation=int(user.get("reputation") or 0),
-        platform=str(user.get("platform") or ""),
-        crossplay=bool(user.get("crossplay", False)),
-        updated_at=str(raw.get("updatedAt") or raw.get("last_update") or ""),
-    )
-
-
-def _parse_item(raw: dict[str, Any]) -> Optional[Item]:
-    slug = raw.get("slug") or raw.get("url_name")
-    i18n = raw.get("i18n") or {}
-    en = i18n.get("en") or next(iter(i18n.values()), {}) if i18n else {}
-    name = en.get("name") or raw.get("name") or raw.get("item_name") or slug
-    if not slug or not name:
-        return None
-    return Item(
-        slug=slug,
-        name=name,
-        icon=en.get("icon"),
-        thumb=en.get("thumb"),
-        tags=tuple(raw.get("tags") or ()),
-        max_rank=raw.get("maxRank"),
-    )
-
-
-def _norm(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-
-
-def _rank_items(items: list[Item], query: str, limit: int) -> list[Item]:
-    """Name search: exact > prefix > substring > all words > typo tolerance."""
-    q = _norm(query)
-    if not q:
-        return items[:limit]
-    scored: list[tuple[float, Item]] = []
-    for it in items:
-        n = _norm(it.name)
-        if n == q or _norm(it.slug) == q:
-            score = 100
-        elif n.startswith(q):
-            score = 80 - min(len(n) - len(q), 40) / 2
-        elif q in n:
-            score = 60 - min(n.index(q), 30) / 2
-        elif all(tok in n for tok in q.split()):
-            score = 50
-        else:
-            continue
-        scored.append((score, it))
-    scored.sort(key=lambda s: (-s[0], len(s[1].name)))
-    results = [it for _, it in scored[:limit]]
-    if not results:                              # typo tolerance
-        names = {_norm(it.name): it for it in items}
-        for m in difflib.get_close_matches(q, list(names), n=limit, cutoff=0.6):
-            results.append(names[m])
-    return results
-
-
+# --------------------------------------------------------------------------- #
+# Name search
+# --------------------------------------------------------------------------- #
 # In-game family names -> the prefix the API uses for those weapons.
 _RIVEN_ALIASES = (
     ("sister of parvos", "coda"), ("sister", "coda"), ("parvos", "coda"),
@@ -160,140 +103,37 @@ def _expand_riven_query(query: str) -> str:
     return q
 
 
-@dataclass(frozen=True)
-class RivenAttribute:
-    url_name: str                   # e.g. "critical_damage", "base_damage_/_melee_damage"
-    value: float                    # percent, already signed (negative = bad stat)
-    positive: bool                  # True when the stat is a buff on this riven
+def _data(payload: Any) -> Any:
+    """v2 wraps everything in {"apiVersion", "data", "error"}."""
+    return payload.get("data") if isinstance(payload, dict) else None
 
 
-@dataclass
-class RivenAuction:
-    """One riven 'contract' (auction) from warframe.market."""
-    id: str
-    weapon: str                     # weapon slug, e.g. "acceltra"
-    name: str                       # riven name, e.g. "sati-acritox"
-    mod_rank: int                   # 0-8
-    re_rolls: int
-    polarity: str                   # "madurai" | "vazarin" | "naramon" | ""
-    mastery_level: Optional[int]
-    attributes: tuple[RivenAttribute, ...]
-    buyout_price: Optional[int]     # set when the seller offers a direct buy
-    starting_price: Optional[int]   # minimum bid for bid-only auctions
-    top_bid: Optional[int]
-    seller: str
-    status: str                     # "ingame" | "online" | "offline"
-    platform: str = ""
-
-    @property
-    def is_online(self) -> bool:
-        return self.status in ONLINE_STATUSES
+def _as_list(payload: Any) -> list:
+    data = _data(payload)
+    return data if isinstance(data, list) else []
 
 
-def _opt_int(value: Any) -> Optional[int]:
-    return None if value is None else int(value)
-
-
-def _parse_riven_auction(raw: dict[str, Any]) -> Optional[RivenAuction]:
-    item = raw.get("item") or {}
-    if item.get("type") != "riven" or raw.get("visible") is False or raw.get("closed"):
-        return None
-    owner = raw.get("owner") or {}
-    attrs = tuple(
-        RivenAttribute(url_name=str(a["url_name"]), value=float(a.get("value") or 0),
-                       positive=bool(a.get("positive")))
-        for a in item.get("attributes") or [] if a.get("url_name"))
-    return RivenAuction(
-        id=str(raw.get("id", "")),
-        weapon=str(item.get("weapon_url_name") or ""),
-        name=str(item.get("name") or ""),
-        mod_rank=int(item.get("mod_rank") or 0),
-        re_rolls=int(item.get("re_rolls") or 0),
-        polarity=str(item.get("polarity") or "").lower(),
-        mastery_level=_opt_int(item.get("mastery_level")),
-        attributes=attrs,
-        buyout_price=_opt_int(raw.get("buyout_price")),
-        starting_price=_opt_int(raw.get("starting_price")),
-        top_bid=_opt_int(raw.get("top_bid")),
-        seller=str(owner.get("ingame_name") or "unknown"),
-        status=str(owner.get("status") or "offline"),
-        platform=str(raw.get("platform") or ""),
-    )
-
-
-LICH_KINDS = ("lich", "sister")     # Kuva Lich / Sister of Parvos auction types
-
-
-@dataclass
-class LichAuction:
-    """One Kuva Lich or Sister of Parvos auction from warframe.market."""
-    id: str
-    kind: str                       # "lich" | "sister"
-    weapon: str                     # weapon slug, e.g. "kuva_kohm"
-    element: str                    # e.g. "toxin"
-    damage: int                     # bonus damage percent
-    ephemera: bool
-    quirk: str                      # lich only; "" when none
-    buyout_price: Optional[int]
-    starting_price: Optional[int]
-    top_bid: Optional[int]
-    seller: str
-    status: str
-    platform: str = ""
-
-    @property
-    def is_online(self) -> bool:
-        return self.status in ONLINE_STATUSES
-
-
-def _parse_lich_auction(raw: dict[str, Any], kind: str) -> Optional[LichAuction]:
-    item = raw.get("item") or {}
-    if item.get("type") != kind or raw.get("visible") is False or raw.get("closed"):
-        return None
-    owner = raw.get("owner") or {}
-    quirk = str(item.get("quirk") or "")
-    return LichAuction(
-        id=str(raw.get("id", "")),
-        kind=kind,
-        weapon=str(item.get("weapon_url_name") or ""),
-        element=str(item.get("element") or ""),
-        damage=int(item.get("damage") or 0),
-        ephemera=bool(item.get("having_ephemera")),
-        quirk="" if quirk == "none" else quirk,
-        buyout_price=_opt_int(raw.get("buyout_price")),
-        starting_price=_opt_int(raw.get("starting_price")),
-        top_bid=_opt_int(raw.get("top_bid")),
-        seller=str(owner.get("ingame_name") or "unknown"),
-        status=str(owner.get("status") or "offline"),
-        platform=str(raw.get("platform") or ""),
-    )
-
-
+# --------------------------------------------------------------------------- #
+# Client
+# --------------------------------------------------------------------------- #
 class WarframeMarketClient:
     """Create once, share everywhere. Pass an aiohttp.ClientSession you manage."""
 
     def __init__(self, session, *, platform: str = "pc", crossplay: bool = True,
-                 language: str = "en", cache_ttl: float = 60.0, min_interval: float = 0.34):
+                 language: str = "en", cache_ttl: float = 60.0, min_interval: float = 0.34,
+                 retry_delay: float = 1.0):
         self.session = session
         self.platform = platform
         self.crossplay = crossplay
         self.language = language
         self.cache_ttl = cache_ttl
+        self.retry_delay = retry_delay
         self._min_interval = min_interval
         self._lock = asyncio.Lock()
         self._last_call = 0.0
         self._cache: dict[tuple, tuple[float, Any]] = {}
-        self._items: list[Item] = []
-        self._items_loaded = 0.0
-        self._items_lock = asyncio.Lock()
-        self._riven_weapons: list[Item] = []
-        self._riven_weapons_loaded = 0.0
-        self._riven_weapons_lock = asyncio.Lock()
-        self._riven_attrs: list[str] = []
-        self._riven_attrs_loaded = 0.0
-        self._riven_attrs_lock = asyncio.Lock()
-        self._lich_weapons: dict[str, tuple[float, list[Item]]] = {}
-        self._lich_weapons_lock = asyncio.Lock()
+        self._catalogs: dict[str, tuple[float, list]] = {}
+        self._catalog_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------- transport
     async def _get(self, url: str, *, params: dict | None = None, platform: str | None = None,
@@ -311,6 +151,25 @@ class WarframeMarketClient:
             "Language": self.language, "Platform": platform,
             "Crossplay": "true" if crossplay else "false",
         }
+        for attempt in range(2):
+            try:
+                data = await self._fetch(url, params, headers)
+                break
+            except MarketError as exc:
+                retryable = exc.status == 429 or (exc.status or 0) >= 500
+                if attempt == 0 and retryable and not isinstance(exc, ItemNotFound):
+                    await asyncio.sleep(self.retry_delay)
+                    continue
+                raise
+
+        self._cache[key] = (time.monotonic(), data)
+        if len(self._cache) > 500:                   # crude bound on memory
+            oldest = sorted(self._cache, key=lambda k: self._cache[k][0])[:100]
+            for k in oldest:
+                self._cache.pop(k, None)
+        return data
+
+    async def _fetch(self, url: str, params: dict | None, headers: dict) -> Any:
         async with self._lock:                       # global rate limit
             wait = self._min_interval - (time.monotonic() - self._last_call)
             if wait > 0:
@@ -324,31 +183,33 @@ class WarframeMarketClient:
                         raise MarketError("warframe.market rate limit hit, try again in a moment", 429)
                     if resp.status >= 400:
                         raise MarketError(f"warframe.market returned HTTP {resp.status}", resp.status)
-                    data = await resp.json()
+                    return await resp.json()
             except MarketError:
                 raise
             except asyncio.TimeoutError as exc:
                 raise MarketError("warframe.market timed out") from exc
-            except Exception as exc:                 # aiohttp.ClientError etc.
+            except Exception as exc:                 # aiohttp.ClientError, bad JSON, ...
                 raise MarketError(f"Could not reach warframe.market: {exc}") from exc
 
-        self._cache[key] = (time.monotonic(), data)
-        if len(self._cache) > 500:                   # crude bound on memory
-            oldest = sorted(self._cache, key=lambda k: self._cache[k][0])[:100]
-            for k in oldest:
-                self._cache.pop(k, None)
-        return data
+    async def _catalog(self, path: str, parser: Callable[[dict], Optional[T]]) -> list[T]:
+        """A v2 list endpoint, parsed and cached for CATALOG_TTL."""
+        lock = self._catalog_locks.setdefault(path, asyncio.Lock())
+        async with lock:
+            hit = self._catalogs.get(path)
+            if hit and hit[1] and time.monotonic() - hit[0] < CATALOG_TTL:
+                return hit[1]
+            payload = await self._get(f"{API_V2}{path}", ttl=0)
+            parsed = [x for x in (parser(r) for r in _as_list(payload) if isinstance(r, dict)) if x]
+            if parsed:
+                self._catalogs[path] = (time.monotonic(), parsed)
+            return parsed or (hit[1] if hit else [])
 
     # ----------------------------------------------------------------- items
     async def _load_items(self) -> list[Item]:
-        async with self._items_lock:
-            if self._items and time.monotonic() - self._items_loaded < 6 * 3600:
-                return self._items
-            data = await self._get(f"{API_V2}/items", ttl=0)
-            items = [i for i in (_parse_item(r) for r in data.get("data", [])) if i]
-            if items:
-                self._items, self._items_loaded = items, time.monotonic()
-            return self._items
+        return await self._catalog("/items", parse_item)
+
+    async def items(self) -> list[Item]:
+        return await self._load_items()
 
     async def search_items(self, query: str, limit: int = 10) -> list[Item]:
         return _rank_items(await self._load_items(), query, limit)
@@ -359,15 +220,140 @@ class WarframeMarketClient:
             raise ItemNotFound(f"No tradable item matches '{query_or_slug}'", 404)
         return found[0]
 
+    async def item_by_id(self, item_id: str) -> Optional[Item]:
+        for it in await self._load_items():
+            if it.id == item_id:
+                return it
+        return None
+
+    async def item_names_by_id(self) -> dict[str, Item]:
+        return {it.id: it for it in await self._load_items() if it.id}
+
+    async def find_exact(self, name: str) -> Optional[Item]:
+        """The item whose name is exactly ``name`` (or ``name + ' Set'``), else None.
+        Used to cross-link wiki pages to the market without false matches."""
+        want = _norm(name)
+        items = await self._load_items()
+        for candidate in (want, want + " set"):
+            for it in items:
+                if _norm(it.name) == candidate:
+                    return it
+        return None
+
+    async def get_item(self, slug: str) -> ItemDetail:
+        try:
+            payload = await self._get(f"{API_V2}/item/{slug}", ttl=3600)
+        except ItemNotFound:
+            payload = None
+        detail = parse_item_detail(_data(payload) or {})
+        if detail is None:
+            raise ItemNotFound(f"warframe.market has no details for '{slug}'", 404)
+        return detail
+
+    async def get_set(self, slug: str) -> list[ItemDetail]:
+        """Every part of the set ``slug`` belongs to, set item first.
+        Items that aren't part of a set come back as a one-element list."""
+        payload = await self._get(f"{API_V2}/item/{slug}/set", ttl=3600)
+        data = _data(payload) or {}
+        raw = data.get("items") if isinstance(data, dict) else data
+        parts = [d for d in (parse_item_detail(r) for r in raw or [] if isinstance(r, dict)) if d]
+        parts.sort(key=lambda d: (not d.set_root, d.item.name))
+        return parts
+
+    # ---------------------------------------------------------------- orders
+    async def get_orders(self, slug: str, *, platform: str | None = None,
+                         crossplay: bool | None = None) -> list[Order]:
+        payload = await self._get(f"{API_V2}/orders/item/{slug}", platform=platform, crossplay=crossplay)
+        raw = _data(payload) or []
+        if isinstance(raw, dict):                    # some responses nest buy/sell
+            raw = [*raw.get("sell", []), *raw.get("buy", [])]
+        return [o for o in (parse_order(r) for r in raw) if o]
+
+    async def get_top_orders(self, slug: str, *, rank: int | None = None, charges: int | None = None,
+                             amber_stars: int | None = None, cyan_stars: int | None = None,
+                             subtype: str | None = None, platform: str | None = None,
+                             crossplay: bool | None = None) -> dict[str, list[Order]]:
+        """Best 5 online sell and buy orders: {"sell": [...cheapest], "buy": [...highest]}."""
+        params = {k: v for k, v in (("rank", rank), ("charges", charges), ("amberStars", amber_stars),
+                                    ("cyanStars", cyan_stars), ("subtype", subtype)) if v is not None}
+        payload = await self._get(f"{API_V2}/orders/item/{slug}/top", params=params or None,
+                                  platform=platform, crossplay=crossplay)
+        data = _data(payload) or {}
+        out: dict[str, list[Order]] = {}
+        for side in ("sell", "buy"):
+            orders = [o for o in (parse_order(r) for r in data.get(side) or []) if o]
+            orders.sort(key=lambda o: o.platinum, reverse=(side == "buy"))
+            out[side] = orders
+        return out
+
+    async def get_recent_orders(self, *, platform: str | None = None,
+                                crossplay: bool | None = None) -> list[Order]:
+        """The most recently posted orders site-wide (up to 500)."""
+        payload = await self._get(f"{API_V2}/orders/recent", platform=platform,
+                                  crossplay=crossplay, ttl=120)
+        return [o for o in (parse_order(r) for r in _as_list(payload)) if o]
+
+    # ----------------------------------------------------------------- users
+    async def get_user(self, name: str) -> UserProfile:
+        slug = name.strip().lower()
+        try:
+            payload = await self._get(f"{API_V2}/user/{slug}", ttl=60)
+        except ItemNotFound:
+            payload = None
+        user = parse_user(_data(payload) or {})
+        if user is None:
+            raise ItemNotFound(f"No warframe.market user called '{name}'", 404)
+        return user
+
+    async def get_user_orders(self, name: str, user: UserProfile | None = None) -> list[Order]:
+        slug = name.strip().lower()
+        payload = await self._get(f"{API_V2}/orders/user/{slug}", ttl=60)
+        owner = {"ingameName": user.name, "status": user.status,
+                 "reputation": user.reputation} if user else {"ingameName": name}
+        return [o for o in (parse_order(r, owner=owner) for r in _as_list(payload)) if o]
+
+    # --------------------------------------------------------------- history
+    async def get_statistics(self, slug: str) -> dict[str, list[StatPoint]]:
+        """Closed-trade statistics: {"48hours": [...], "90days": [...]} (v1, best effort).
+        Raises MarketError on network trouble; returns empty lists when the
+        endpoint answers with something unexpected."""
+        payload = await self._get(f"{API_V1}/items/{slug}/statistics", ttl=600)
+        closed = ((payload or {}).get("payload") or {}).get("statistics_closed") or {}
+        return {k: [p for p in (parse_stat_point(r) for r in closed.get(k) or []) if p]
+                for k in ("48hours", "90days")}
+
+    async def get_history(self, slug: str) -> Optional[dict]:
+        """48h sales summary (best effort: returns None on any problem)."""
+        try:
+            data = await self._get(f"{API_V1}/items/{slug}/statistics", ttl=300)
+            rows = data["payload"]["statistics_closed"]["48hours"]
+        except Exception:
+            return None
+        if not rows:
+            return None
+        volume = sum(int(r.get("volume") or 0) for r in rows)
+        if volume == 0:
+            return {"volume_48h": 0, "avg_price_48h": None, "median_48h": None}
+        weighted = sum(float(r.get("avg_price") or 0) * int(r.get("volume") or 0) for r in rows)
+        medians = sorted(float(r["median"]) for r in rows if r.get("median") is not None)
+        return {
+            "volume_48h": volume,
+            "avg_price_48h": round(weighted / volume, 1),
+            "median_48h": medians[len(medians) // 2] if medians else None,
+        }
+
+    # --------------------------------------------------------------- rivens
+    async def riven_weapon_catalog(self) -> list[RivenWeapon]:
+        return await self._catalog("/riven/weapons", parse_riven_weapon)
+
     async def _load_riven_weapons(self) -> list[Item]:
-        async with self._riven_weapons_lock:
-            if self._riven_weapons and time.monotonic() - self._riven_weapons_loaded < 6 * 3600:
-                return self._riven_weapons
-            data = await self._get(f"{API_V2}/riven/weapons", ttl=0)
-            weapons = [w for w in (_parse_item(r) for r in data.get("data", [])) if w]
-            if weapons:
-                self._riven_weapons, self._riven_weapons_loaded = weapons, time.monotonic()
-            return self._riven_weapons
+        return [w.item for w in await self.riven_weapon_catalog()]
+
+    async def riven_weapon_info(self, slug: str) -> Optional[RivenWeapon]:
+        for w in await self.riven_weapon_catalog():
+            if w.item.slug == slug:
+                return w
+        return None
 
     async def search_riven_weapons(self, query: str, limit: int = 10) -> list[Item]:
         """Riven-eligible weapons. Unlike the general item list, this includes
@@ -387,98 +373,54 @@ class WarframeMarketClient:
             raise ItemNotFound(f"No riven weapon matches '{query}'", 404)
         q = _expand_riven_query(query)
         exact = [it for it in found if q in (_norm(it.name), _norm(it.slug))]
-        if exact:
-            return exact[:1]
-        return found
+        return exact[:1] if exact else found
+
+    async def riven_attribute_catalog(self) -> list[CatalogEntry]:
+        return await self._catalog("/riven/attributes", parse_catalog_entry)
 
     async def get_riven_attributes(self) -> list[str]:
-        """url_name slugs of every riven stat (e.g. 'critical_damage'), cached 6h."""
-        async with self._riven_attrs_lock:
-            if self._riven_attrs and time.monotonic() - self._riven_attrs_loaded < 6 * 3600:
-                return self._riven_attrs
-            data = await self._get(f"{API_V2}/riven/attributes", ttl=0)
-            slugs = [str(r["slug"]) for r in data.get("data", []) if r.get("slug")]
-            if slugs:
-                self._riven_attrs, self._riven_attrs_loaded = slugs, time.monotonic()
-            return self._riven_attrs
+        """url_name slugs of every riven stat (e.g. 'critical_damage')."""
+        return [a.slug for a in await self.riven_attribute_catalog()]
 
-    async def _load_lich_weapons(self, kind: str) -> list[Item]:
-        async with self._lich_weapons_lock:
-            hit = self._lich_weapons.get(kind)
-            if hit and time.monotonic() - hit[0] < 6 * 3600:
-                return hit[1]
-            data = await self._get(f"{API_V2}/{kind}/weapons", ttl=0)
-            weapons = [w for w in (_parse_item(r) for r in data.get("data", [])) if w]
-            if weapons:
-                self._lich_weapons[kind] = (time.monotonic(), weapons)
-            return weapons or (hit[1] if hit else [])
-
-    async def search_lich_weapons(self, kind: str, query: str, limit: int = 10) -> list[Item]:
-        """Kuva Lich ('lich') or Sister of Parvos ('sister') weapons."""
-        if kind not in LICH_KINDS:
-            raise ValueError(f"kind must be one of {LICH_KINDS}")
-        return _rank_items(await self._load_lich_weapons(kind), query, limit)
-
-    async def resolve_lich_weapon(self, kind: str, query: str) -> Item:
-        found = await self.search_lich_weapons(kind, query, 1)
-        if not found:
-            raise ItemNotFound(f"No {kind} weapon matches '{query}'", 404)
-        return found[0]
-
-    # ---------------------------------------------------------------- orders
-    async def get_orders(self, slug: str, *, platform: str | None = None,
-                         crossplay: bool | None = None) -> list[Order]:
-        data = await self._get(f"{API_V2}/orders/item/{slug}", platform=platform, crossplay=crossplay)
-        raw = data.get("data", [])
-        if isinstance(raw, dict):                    # some responses nest buy/sell
-            raw = [*raw.get("sell", []), *raw.get("buy", [])]
-        return [o for o in (_parse_order(r) for r in raw) if o]
-
-    async def get_history(self, slug: str) -> Optional[dict]:
-        """48h sales summary from the v1 statistics endpoint (best effort: this
-        endpoint is older and may change; returns None on any problem)."""
-        try:
-            data = await self._get(f"{API_V1}/items/{slug}/statistics", ttl=300)
-            rows = data["payload"]["statistics_closed"]["48hours"]
-        except Exception:
-            return None
-        if not rows:
-            return None
-        volume = sum(int(r.get("volume") or 0) for r in rows)
-        if volume == 0:
-            return {"volume_48h": 0, "avg_price_48h": None, "median_48h": None}
-        weighted = sum(float(r.get("avg_price") or 0) * int(r.get("volume") or 0) for r in rows)
-        medians = sorted(float(r["median"]) for r in rows if r.get("median") is not None)
-        return {
-            "volume_48h": volume,
-            "avg_price_48h": round(weighted / volume, 1),
-            "median_48h": medians[len(medians) // 2] if medians else None,
-        }
-
-    # -------------------------------------------------------- riven contracts
     async def get_riven_auctions(self, weapon_slug: str, *, platform: str | None = None,
                                  crossplay: bool | None = None) -> list[RivenAuction]:
-        """Riven auctions ('contracts') for one weapon, from the v1 auction search.
-        Hidden and closed auctions and non-riven entries are dropped."""
+        """Riven auctions for one weapon. Hidden/closed/non-riven entries are dropped."""
         data = await self._get(f"{API_V1}/auctions/search",
                                params={"type": "riven", "weapon_url_name": weapon_slug},
                                platform=platform, crossplay=crossplay)
-        if not isinstance(data, dict):
-            return []
-        raw = (data.get("payload") or {}).get("auctions") or []
-        return [a for a in (_parse_riven_auction(r) for r in raw) if a]
+        raw = ((data or {}).get("payload") or {}).get("auctions") or [] if isinstance(data, dict) else []
+        return [a for a in (parse_riven_auction(r) for r in raw) if a]
 
-    # ------------------------------------------------ lich / sister auctions
-    async def get_lich_auctions(self, kind: str, weapon_slug: str, *, platform: str | None = None,
-                                crossplay: bool | None = None) -> list[LichAuction]:
-        """Kuva Lich / Sister of Parvos auctions for one weapon (v1 auction search).
-        Hidden and closed auctions are dropped."""
-        if kind not in LICH_KINDS:
-            raise ValueError(f"kind must be one of {LICH_KINDS}")
-        data = await self._get(f"{API_V1}/auctions/search",
-                               params={"type": kind, "weapon_url_name": weapon_slug},
+    # ------------------------------------------------------- lich / sister
+    async def weapon_catalog(self, kind: str) -> list[CatalogEntry]:
+        """kind = "lich" | "sister"."""
+        return await self._catalog(f"/{kind}/weapons", parse_catalog_entry)
+
+    async def ephemera_catalog(self, kind: str) -> list[CatalogEntry]:
+        return await self._catalog(f"/{kind}/ephemeras", parse_catalog_entry)
+
+    async def quirk_catalog(self, kind: str = "lich") -> list[CatalogEntry]:
+        return await self._catalog(f"/{kind}/quirks", parse_catalog_entry)
+
+    async def search_weapons(self, kind: str, query: str, limit: int = 10) -> list[CatalogEntry]:
+        return _rank_items(await self.weapon_catalog(kind), _expand_riven_query(query), limit)
+
+    async def resolve_weapon(self, kind: str, query: str) -> CatalogEntry:
+        found = await self.search_weapons(kind, query, 1)
+        if not found:
+            label = "Kuva Lich" if kind == "lich" else "Sister of Parvos"
+            raise ItemNotFound(f"No {label} weapon matches '{query}'", 404)
+        return found[0]
+
+    async def get_weapon_auctions(self, kind: str, weapon_slug: str, *, element: str | None = None,
+                                  ephemera: bool | None = None, platform: str | None = None,
+                                  crossplay: bool | None = None) -> list[WeaponAuction]:
+        params: dict[str, Any] = {"type": kind, "weapon_url_name": weapon_slug}
+        if element:
+            params["element"] = element
+        if ephemera is not None:
+            params["ephemera"] = "true" if ephemera else "false"
+        data = await self._get(f"{API_V1}/auctions/search", params=params,
                                platform=platform, crossplay=crossplay)
-        if not isinstance(data, dict):
-            return []
-        raw = (data.get("payload") or {}).get("auctions") or []
-        return [a for a in (_parse_lich_auction(r, kind) for r in raw) if a]
+        raw = ((data or {}).get("payload") or {}).get("auctions") or [] if isinstance(data, dict) else []
+        return [a for a in (parse_weapon_auction(r) for r in raw) if a]
