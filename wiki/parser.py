@@ -247,8 +247,38 @@ def _subheading_text(node: Tag) -> str:
     return " ".join(re.sub(r"\[\s*edit.*?\]", "", _clean_text(h3)).split())
 
 
+_NAVBOX_HINTS = ("navbox", "WarframeNavBox", "navigation", "mw-collapsed", "metadata")
+
+
+def _is_navbox(tag: Tag) -> bool:
+    classes = " ".join(tag.get("class") or [])
+    return any(h.lower() in classes.lower() for h in _NAVBOX_HINTS) or tag.get("role") == "navigation"
+
+
+def _table_lines(table: Tag, *, max_rows: int = 40) -> list[str]:
+    """A table as readable lines: header cells in bold, then one line per row
+    with the cells joined by " \u00B7 ". Navigation boxes and nested tables are skipped."""
+    if _is_navbox(table):
+        return []
+    lines: list[str] = []
+    rows = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+    for tr in rows[:max_rows]:
+        cells = [c for c in tr.find_all(["th", "td"], recursive=False)]
+        texts = [_clean_text(c) for c in cells]
+        texts = [t for t in texts if t]
+        if not texts:
+            continue
+        if all(c.name == "th" for c in cells):
+            lines.append("**" + " \u00B7 ".join(texts) + "**")
+        else:
+            lines.append("\u25AB " + " \u00B7 ".join(texts))
+    if len(rows) > max_rows:
+        lines.append(f"*...and {len(rows) - max_rows} more rows on the wiki*")
+    return lines
+
+
 def _extract_article_sections(soup: BeautifulSoup, *, max_sections: int = 24,
-                              max_lines: int = 80) -> dict[str, str]:
+                              max_lines: int = 150) -> dict[str, str]:
     """Pull plain-text body content for each ``==Heading==`` in the article
     (e.g. "Acquisition", "Trivia", "Characteristics", "Notes"). Tables,
     images, and nested widgets are skipped in favor of paragraphs and
@@ -276,10 +306,16 @@ def _extract_article_sections(soup: BeautifulSoup, *, max_sections: int = 24,
                     text = _clean_text(li)
                     if text:
                         lines.append(f"\u2022 {text}")
+            elif node.name == "table":
+                lines.extend(_table_lines(node))
             else:
                 sub = _subheading_text(node)
                 if sub:
                     lines.append(f"**{sub}**")
+                elif node.name == "div" and not _is_navbox(node):
+                    for table in node.find_all("table"):
+                        if table.find_parent("table") is None and not _is_navbox(table):
+                            lines.extend(_table_lines(table))
             node = node.find_next_sibling()
 
         if lines:

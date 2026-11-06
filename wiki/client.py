@@ -29,10 +29,9 @@ log = logging.getLogger("warframebot.wiki.client")
 
 API_URL = "https://wiki.warframe.com/api.php"
 BASE_URL = "https://wiki.warframe.com"
-USER_AGENT = (
-    "WarframeBOT/1.0 (+https://wiki.warframe.com user-installed Discord app; "
-    "contact: bot owner via Discord) Python-aiohttp"
-)
+USER_AGENT = "WarframeBOT/2.0 (Discord bot; https://github.com/0xsint/My-Warframe-Bot) Python-aiohttp"
+CATEGORY_TTL = 12 * 3600
+CATEGORY_MAX_PAGES = 10           # 10 x 500 titles is far more than any category here
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
@@ -66,6 +65,7 @@ class WarframeWikiClient:
         self._page_cache_ttl = page_cache_ttl
         self._cache: dict[str, _CacheEntry] = {}
         self._semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self._category_locks: dict[str, asyncio.Lock] = {}
 
     # -- caching helpers -------------------------------------------------
 
@@ -79,7 +79,10 @@ class WarframeWikiClient:
 
     def _set_cached(self, key: str, value: Any, ttl: float) -> None:
         self._cache[key] = _CacheEntry(value, time.monotonic() + ttl)
-        print(key)
+        if len(self._cache) > 2000:                   # crude bound on memory
+            now = time.monotonic()
+            for k in [k for k, e in self._cache.items() if e.expires_at <= now][:500]:
+                self._cache.pop(k, None)
 
     # -- low level request -------------------------------------------------
 
@@ -194,3 +197,51 @@ class WarframeWikiClient:
                 raise
             # Last resort: try the raw query directly in case opensearch missed it.
             return await self.get_page(query)
+
+    # -- categories / random ------------------------------------------------
+
+    def cached_category(self, category: str) -> Optional[list[str]]:
+        """Titles of ``category`` if they are already loaded, else None (never blocks)."""
+        return self._get_cached(f"category:{category.lower()}")
+
+    async def category_members(self, category: str) -> list[str]:
+        """Every article title in ``Category:<category>`` (namespace 0), cached for 12h."""
+        key = f"category:{category.lower()}"
+        cached = self._get_cached(key)
+        if cached is not None:
+            return cached
+        lock = self._category_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            cached = self._get_cached(key)
+            if cached is not None:
+                return cached
+            titles: list[str] = []
+            params: dict[str, Any] = {"action": "query", "list": "categorymembers",
+                                      "cmtitle": f"Category:{category}", "cmnamespace": 0,
+                                      "cmlimit": 500, "cmtype": "page"}
+            for _ in range(CATEGORY_MAX_PAGES):
+                data = await self._request(params)
+                titles += [m["title"] for m in data.get("query", {}).get("categorymembers", [])
+                           if m.get("title")]
+                cont = data.get("continue", {}).get("cmcontinue")
+                if not cont:
+                    break
+                params = {**params, "cmcontinue": cont}
+            self._set_cached(key, titles, CATEGORY_TTL)
+            return titles
+
+    async def categories_members(self, categories: tuple[str, ...]) -> list[str]:
+        """Union of several categories (missing ones are just empty), order kept."""
+        seen: dict[str, None] = {}
+        for cat in categories:
+            try:
+                for title in await self.category_members(cat):
+                    seen.setdefault(title, None)
+            except WikiError:
+                continue
+        return list(seen)
+
+    async def random_title(self) -> Optional[str]:
+        data = await self._request({"action": "query", "list": "random", "rnnamespace": 0, "rnlimit": 1})
+        pages = data.get("query", {}).get("random", [])
+        return pages[0]["title"] if pages else None

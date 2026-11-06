@@ -68,7 +68,8 @@ class BaseView(nextcord.ui.View):
 
     async def on_timeout(self) -> None:
         for item in self.children:
-            item.disabled = True
+            if getattr(item, "url", None) is None:     # link buttons keep working
+                item.disabled = True
         if self.message is not None:
             try:
                 await self.message.edit(view=self)
@@ -79,7 +80,10 @@ class BaseView(nextcord.ui.View):
 class SectionView(BaseView):
     def __init__(self, sections: Sequence[Section], *, footer_text: Optional[str] = None,
                  footer_icon: Optional[str] = None, chain: bool = False,
-                 select_placeholder: str = "Pick a section", timeout: float = 600):
+                 select_placeholder: str = "Pick a section", timeout: float = 600,
+                 links: Sequence[tuple[str, str]] = (), start: Optional[str] = None):
+        """``links``: (label, url) pairs shown as link buttons (e.g. wiki <-> market).
+        ``start``: label of the section to open first (case-insensitive prefix)."""
         super().__init__(timeout=timeout)
         self.sections = _unique_sections(sections)
         if not self.sections:
@@ -89,6 +93,12 @@ class SectionView(BaseView):
         self.chain = chain
         self.section_idx = 0
         self.page_idx = 0
+        if start:
+            want = start.lower()
+            for i, sec in enumerate(self.sections):
+                if sec.label.lower().startswith(want):
+                    self.section_idx = i
+                    break
         self.select = None
         self.prev_btn = None
         self.next_btn = None
@@ -100,7 +110,8 @@ class SectionView(BaseView):
                 desc = s.description or (f"{n} pages" if n > 1 else "1 page")
                 kw = {"emoji": s.emoji} if s.emoji else {}
                 options.append(nextcord.SelectOption(label=s.label[:100], value=str(i),
-                                                     description=desc[:100], default=(i == 0), **kw))
+                                                     description=desc[:100],
+                                                     default=(i == self.section_idx), **kw))
             self.select = nextcord.ui.Select(placeholder=select_placeholder, options=options)
             self.select.custom_id = "section_select"
             self.select.callback = self._on_select
@@ -115,6 +126,8 @@ class SectionView(BaseView):
             self.next_btn.callback = self._on_next
             self.add_item(self.prev_btn)
             self.add_item(self.next_btn)
+        for label, url in list(links)[:3]:
+            self.add_item(nextcord.ui.Button(label=label[:80], url=url, style=nextcord.ButtonStyle.link))
         self._sync()
 
     # --------------------------------------------------------------- position

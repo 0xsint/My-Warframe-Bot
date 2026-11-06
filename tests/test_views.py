@@ -35,8 +35,18 @@ class FakeInteraction:
         self.edits.append(kw)
 
 
+LOOP = asyncio.new_event_loop()
+
+
 def run(coro):
-    return asyncio.run(coro)
+    return LOOP.run_until_complete(coro)
+
+
+def build(factory, *args, **kwargs):
+    """Real nextcord Views must be created inside a running event loop."""
+    async def make():
+        return factory(*args, **kwargs)
+    return run(make())
 
 
 def emb(title):
@@ -73,7 +83,7 @@ class TextTests(unittest.TestCase):
 
 class SectionViewTests(unittest.TestCase):
     def make(self, **kw):
-        return SectionView([Section("Overview", [emb("o")]),
+        return build(SectionView, [Section("Overview", [emb("o")]),
                             Section("Info", [emb("i1"), emb("i2"), emb("i3")]),
                             Section("Tips", [emb("t1")])], footer_text="foot", **kw)
 
@@ -116,27 +126,27 @@ class SectionViewTests(unittest.TestCase):
         self.assertEqual(v.current_embed().title, "i3")
 
     def test_single_page_has_no_controls(self):
-        v = SectionView([Section("Only", [emb("x")])])
+        v = build(SectionView, [Section("Only", [emb("x")])])
         self.assertEqual(v.children, [])
         self.assertNotIn("view", view_kwargs(v))
 
     def test_single_section_paginated_has_buttons_but_no_dropdown(self):
-        v = SectionView([Section("Orders", [emb("a"), emb("b")])], footer_text="f")
+        v = build(SectionView, [Section("Orders", [emb("a"), emb("b")])], footer_text="f")
         self.assertIsNone(v.select)
         self.assertEqual(len(v.children), 2)
         self.assertEqual(v.current_embed().footer.text, "Page 1/2 · f")
 
     def test_duplicate_labels_and_empty_sections(self):
-        v = SectionView([Section("A", [emb("1")]), Section("A", [emb("2")]), Section("Empty", [])])
+        v = build(SectionView, [Section("A", [emb("1")]), Section("A", [emb("2")]), Section("Empty", [])])
         self.assertEqual([o.label for o in v.select.options], ["A", "A (2)"])
 
     def test_dropdown_capped_at_25(self):
-        v = SectionView([Section(f"S{i}", [emb(str(i))]) for i in range(40)])
+        v = build(SectionView, [Section(f"S{i}", [emb(str(i))]) for i in range(40)])
         self.assertEqual(len(v.select.options), 25)
 
     def test_no_sections_is_an_error(self):
         with self.assertRaises(ValueError):
-            SectionView([Section("x", [])])
+            build(SectionView, [Section("x", [])])
 
 
 WEAPON_HTML = """
@@ -172,7 +182,7 @@ class WikiPageViewTests(unittest.TestCase):
         self.assertEqual(detect_kind(self.page), "weapon")
 
     def test_sections_in_dropdown_and_noise_skipped(self):
-        v = build_page_view(self.page)
+        v = build(build_page_view, self.page)
         labels = [o.label for o in v.select.options]
         self.assertEqual(labels[0], "Overview")
         self.assertEqual(labels[1:3], ["General Information", "Normal Attack"])   # preferred weapon order
@@ -181,7 +191,7 @@ class WikiPageViewTests(unittest.TestCase):
         self.assertNotIn("See also", labels)
 
     def test_long_section_paginates_within_embed_limit(self):
-        v = build_page_view(self.page)
+        v = build(build_page_view, self.page)
         pick(v, [o.label for o in v.select.options].index("Acquisition"))
         n = len(v.sections[v.section_idx].pages)
         self.assertGreater(n, 1)
@@ -193,7 +203,7 @@ class WikiPageViewTests(unittest.TestCase):
 
     def test_page_with_only_overview_has_no_controls(self):
         page = parse_page("Stub", "u", "<p>Just a short page with a lead paragraph that is long enough.</p>")
-        v = build_page_view(page)
+        v = build(build_page_view, page)
         self.assertEqual(v.children, [])
 
 
@@ -205,7 +215,7 @@ class SearchViewTests(unittest.TestCase):
         async def on_pick(interaction, title):
             self.picked.append(title)
 
-        self.view = SearchView("page", self.results, on_pick)
+        self.view = build(SearchView, "page", self.results, on_pick)
 
     def test_dropdown_lists_current_page_only(self):
         self.assertEqual(len(self.view.select.options), 10)
@@ -220,10 +230,11 @@ class SearchViewTests(unittest.TestCase):
         self.view.select._selected_values = ["Page 4"]
         run(self.view.select.callback(FakeInteraction()))
         self.assertEqual(self.picked, ["Page 4"])
-        self.assertTrue(self.view.stopped)
+        stopped = getattr(self.view, "stopped", None)
+        self.assertTrue(stopped if stopped is not None else self.view.is_finished())
 
     def test_short_result_list_has_no_buttons(self):
-        v = SearchView("x", self.results[:4], self.view.on_pick)
+        v = build(SearchView, "x", self.results[:4], self.view.on_pick)
         self.assertEqual(len(v.children), 1)
 
 
@@ -244,9 +255,10 @@ class MarketViewTests(unittest.TestCase):
         labels = [s.label for s in sections]
         self.assertEqual(labels[:2], ["Overview", "Competition"])
         self.assertIn("Last 48h sales", labels)
-        self.assertEqual(sections[0].pages[0].image, ITEM.image_url)
+        image = sections[0].pages[0].image
+        self.assertEqual(getattr(image, "url", image), ITEM.image_url)
         self.assertTrue(any("Your price" in f.name for f in sections[0].pages[0].fields))
-        v = SectionView(sections, footer_text="f", chain=True)
+        v = build(SectionView, sections, footer_text="f", chain=True)
         steps = 0
         while not v.next_btn.disabled:
             click(v, v.next_btn); steps += 1
@@ -283,12 +295,15 @@ class MarketViewTests(unittest.TestCase):
         self.assertNotIn("Tenno3", pages[0].description)
 
     def test_trend_pages(self):
-        trends = {f"Item {i}": {"count": 50 - i, "average_platinum": i, "total_quantity": 60 - i} for i in range(23)}
-        pages = M.trend_pages(trends)
+        from market.insights import TrendRow
+        rows = [TrendRow(item=Item(slug=f"i{i}", name=f"Item {i}"), orders=50 - i, sells=30 - i, buys=20,
+                         quantity=60 - i, avg_sell=i + 5, avg_buy=i) for i in range(23)]
+        pages = M.trend_pages(rows)
         self.assertEqual(len(pages), 3)
         self.assertIn("\U0001F947", pages[0].description)
         self.assertIn("`11.`", pages[1].description)
-        self.assertIn("not enough", M.trend_pages({})[0].description.lower())
+        self.assertIn("avg sell **5p**", pages[0].description)
+        self.assertIn("not enough", M.trend_pages([])[0].description.lower())
 
     def test_my_orders_sections(self):
         def o(i, t):
@@ -305,13 +320,18 @@ class MarketViewTests(unittest.TestCase):
         self.assertIn("no orders", M.my_orders_sections([])[0].pages[0].description)
 
     def test_ducats_embed(self):
-        e = M.ducats_embed({"name": "Mirage Prime Set", "ducats": 100, "average_platinum": 5.0}, ITEM)
-        verdict = [f.value for f in e.fields if f.name == "Verdict"][0]
-        self.assertIn("Ducats look", verdict)
-        e = M.ducats_embed({"name": "X", "ducats": 15, "average_platinum": 45.0})
-        self.assertIn("Platinum", [f.value for f in e.fields if f.name == "Verdict"][0])
-        e = M.ducats_embed({"name": "X", "ducats": 0, "average_platinum": 45.0})
-        self.assertIn("can't be sold", [f.value for f in e.fields if f.name == "Verdict"][0])
+        from market.models import ItemDetail
+
+        def verdict(ducats, sell, buy):
+            detail = ItemDetail(item=Item(slug="x", name="X", ducats=ducats))
+            top = {"sell": [order(1, "sell", plat=sell)] if sell else [],
+                   "buy": [order(2, "buy", plat=buy)] if buy else []}
+            e = M.ducats_embed(detail, top)
+            return [f.value for f in e.fields if f.name == "Verdict"][0]
+        self.assertIn("Turn it into ducats", verdict(100, 8, 5))        # 20 ducats/plat
+        self.assertIn("Sell it for platinum", verdict(15, 50, 45))
+        self.assertIn("can't be traded", verdict(0, 50, 45))
+        self.assertIn("ducats are the safe choice", verdict(45, None, None))
 
     def test_listing_embeds(self):
         o = SimpleNamespace(id="abc", item_name="Serration", order_type="sell", platinum=30, quantity=2,

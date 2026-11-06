@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+pyvenv.cfg
+Scripts/
+Lib/
+Include/
+
+# Secrets and runtime output
+.env
+*.log
+data/
+
+# Scratch files
+_tmp_*
